@@ -216,6 +216,7 @@ func (h *Handler) headObject(ctx context.Context, w http.ResponseWriter, bucket,
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("ETag", quoteETag(obj.ETag))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.WriteHeader(http.StatusOK)
 }
 
