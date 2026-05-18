@@ -40,12 +40,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.authorized(r) {
+	bucket, key := parsePath(r.URL.Path)
+	publicObjectRead := (r.Method == http.MethodGet || r.Method == http.MethodHead) && bucket != "" && key != ""
+	if !publicObjectRead && !h.authorized(r) {
 		h.writeError(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 		return
 	}
 
-	bucket, key := parsePath(r.URL.Path)
 	ctx := r.Context()
 
 	switch {
@@ -196,6 +197,7 @@ func (h *Handler) getObject(ctx context.Context, w http.ResponseWriter, r *http.
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("ETag", quoteETag(obj.ETag))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, body)
 }
