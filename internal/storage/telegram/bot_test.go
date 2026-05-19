@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,10 @@ type fakeTelegram struct {
 	seq      int64
 	failFrom int // if >0, sendDocument fails once seq index >= failFrom (0-based count)
 	sent     int
+	attempts int // total sendDocument calls incl. flooded ones
+	floodN   int  // answer the next floodN calls with HTTP 429 (flood control)
+	floodRA  int  // retry_after seconds to advertise in the 429 (0 => omit hint)
+	permFail bool // answer every call with a permanent HTTP 400 (not retryable)
 }
 
 func newFakeTelegram() *fakeTelegram {
@@ -42,6 +47,22 @@ func (f *fakeTelegram) server(t *testing.T) *httptest.Server {
 		data, _ := io.ReadAll(file)
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		f.attempts++
+		if f.permFail {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`))
+			return
+		}
+		if f.floodN > 0 {
+			f.floodN--
+			w.WriteHeader(http.StatusTooManyRequests)
+			if f.floodRA > 0 {
+				fmt.Fprintf(w, `{"ok":false,"error_code":429,"description":"Too Many Requests: retry after %d","parameters":{"retry_after":%d}}`, f.floodRA, f.floodRA)
+			} else {
+				w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests"}`))
+			}
+			return
+		}
 		idx := f.sent
 		f.sent++
 		if f.failFrom > 0 && idx >= f.failFrom {
@@ -181,6 +202,93 @@ func TestUploadCleansUpOnMidStreamFailure(t *testing.T) {
 	defer f.mu.Unlock()
 	if !f.deleted[1001] {
 		t.Fatalf("orphaned first chunk not cleaned up; deleted=%v", f.deleted)
+	}
+}
+
+// TestUploadRetriesFloodControlThenSucceeds: a burst that trips Telegram's
+// flood control (HTTP 429) must be retried, not surfaced as a hard failure.
+func TestUploadRetriesFloodControlThenSucceeds(t *testing.T) {
+	f := newFakeTelegram()
+	f.floodN = 2 // first two sendDocument calls 429, third succeeds
+	b := newTestBot(t, f, 8)
+
+	chunks, err := b.Upload(context.Background(), "obj", "application/octet-stream",
+		bytes.NewReader([]byte("hello")))
+	if err != nil {
+		t.Fatalf("upload should survive flood control, got: %v", err)
+	}
+	if len(chunks) != 1 || chunks[0].Size != 5 {
+		t.Fatalf("chunks = %+v, want one 5-byte chunk", chunks)
+	}
+	if f.attempts != 3 || f.sent != 1 {
+		t.Fatalf("attempts=%d sent=%d, want 3 attempts and 1 stored", f.attempts, f.sent)
+	}
+}
+
+// TestUploadDoesNotRetryPermanentError: a non-transient Telegram error (4xx
+// other than 429) must fail fast, not burn the retry budget.
+func TestUploadDoesNotRetryPermanentError(t *testing.T) {
+	f := newFakeTelegram()
+	f.permFail = true
+	b := newTestBot(t, f, 8)
+
+	start := time.Now()
+	_, err := b.Upload(context.Background(), "obj", "application/octet-stream",
+		bytes.NewReader([]byte("hello")))
+	if err == nil {
+		t.Fatal("expected a permanent error")
+	}
+	if f.attempts != 1 {
+		t.Fatalf("permanent error retried: attempts=%d, want 1", f.attempts)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("permanent error should not back off; took %s", elapsed)
+	}
+}
+
+// TestUploadRetryRespectsContextCancel: a wedged backend (perpetual 429) must
+// not hang the request — a cancelled context aborts the retry loop promptly.
+func TestUploadRetryRespectsContextCancel(t *testing.T) {
+	f := newFakeTelegram()
+	f.floodN = 1000 // never recovers
+	b := newTestBot(t, f, 8)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := b.Upload(ctx, "obj", "application/octet-stream", bytes.NewReader([]byte("hello")))
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("retry loop ignored ctx cancel; took %s", elapsed)
+	}
+}
+
+// TestUploadSmallObjectDoesNotBufferChunkSize is the OOM regression guard: a
+// tiny object with a production-sized chunk window must allocate ~its size,
+// not chunkSize. The old make([]byte, chunkSize) allocated chunkSize per call
+// regardless of payload and OOM-killed the container under concurrent PUTs.
+func TestUploadSmallObjectDoesNotBufferChunkSize(t *testing.T) {
+	f := newFakeTelegram()
+	b := newTestBot(t, f, 32<<20) // 32 MiB window, like production's 18 MiB
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	chunks, err := b.Upload(context.Background(), "tiny", "application/octet-stream",
+		bytes.NewReader([]byte("x")))
+	runtime.ReadMemStats(&after)
+
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if len(chunks) != 1 || chunks[0].Size != 1 {
+		t.Fatalf("chunks = %+v, want one 1-byte chunk", chunks)
+	}
+	const limit = 4 << 20 // generous; old code would allocate >= 32 MiB here
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > limit {
+		t.Fatalf("Upload of 1 byte allocated %d bytes (> %d) — chunkSize-sized buffer regressed", grew, limit)
 	}
 }
 

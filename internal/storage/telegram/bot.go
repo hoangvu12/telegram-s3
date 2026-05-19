@@ -1,8 +1,10 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -46,37 +48,45 @@ func NewBotStorage(token, chatID, baseURL string, logger *slog.Logger) *BotStora
 }
 
 // Upload reads body in chunkSize windows, sending each as its own Telegram
-// document, and returns the ordered chunk list. Peak memory is one chunk
-// (the reusable buffer), not the whole object — fixing the old bytes.Buffer
-// blowup. Whether the body is short/truncated is the caller's concern: we
-// store whatever bytes we receive and let putObject validate the total
-// against X-Amz-Decoded-Content-Length.
+// document, and returns the ordered chunk list. Peak memory is one chunk and
+// grows only to the chunk's *actual* size: a 1-byte object costs a few bytes,
+// not chunkSize. The previous make([]byte, chunkSize) allocated 18 MiB per
+// call regardless of payload size, so ~10 concurrent small PUTs (the aws-cli
+// default for `s3 cp --recursive`) pinned ~180 MiB of buffers and the
+// container was OOM-killed mid-bulk-upload (the proxy then 502s). Whether the
+// body is short/truncated is the caller's concern: we store whatever bytes we
+// receive and let putObject validate the total against
+// X-Amz-Decoded-Content-Length.
 func (b *BotStorage) Upload(ctx context.Context, name, contentType string, body io.Reader) ([]storage.Chunk, error) {
 	var chunks []storage.Chunk
 	var offset int64
-	buf := make([]byte, b.chunkSize)
+	scratch := make([]byte, 64<<10) // small fixed read buffer, reused every chunk
+	var chunk bytes.Buffer          // grows to the chunk's real size, reused
 	for seq := 0; ; seq++ {
-		n, rerr := io.ReadFull(body, buf)
+		chunk.Reset()
+		// io.Copy maps a source EOF to err==nil, so a non-nil rerr is a real
+		// read/framing error (e.g. malformed aws-chunked input); a short read
+		// (n < chunkSize) means the body is exhausted.
+		n, rerr := io.CopyBuffer(&chunk, io.LimitReader(body, int64(b.chunkSize)), scratch)
 		if n > 0 {
-			ch, err := b.sendChunk(ctx, name, contentType, seq, buf[:n])
+			ch, err := b.sendChunk(ctx, name, contentType, seq, chunk.Bytes())
 			if err != nil {
 				b.cleanup(ctx, chunks)
 				return nil, err
 			}
 			ch.Seq = seq
-			ch.Size = int64(n)
+			ch.Size = n
 			ch.Offset = offset
 			chunks = append(chunks, ch)
-			offset += int64(n)
+			offset += n
 		}
-		if rerr == nil {
-			continue // full window; there may be more
+		if rerr != nil {
+			b.cleanup(ctx, chunks) // malformed framing etc.
+			return nil, rerr
 		}
-		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+		if n < int64(b.chunkSize) {
 			break // body exhausted (short body is caught upstream)
 		}
-		b.cleanup(ctx, chunks) // malformed framing etc.
-		return nil, rerr
 	}
 	return chunks, nil
 }
@@ -89,9 +99,58 @@ func (b *BotStorage) cleanup(ctx context.Context, chunks []storage.Chunk) {
 	}
 }
 
-// sendChunk streams data (already in memory) as a multipart sendDocument via
-// an io.Pipe, so the request body is not copied into a second buffer.
+// errRetryable wraps a transient sendDocument failure. retryAfter > 0 is the
+// delay Telegram explicitly asked for (HTTP 429 / parameters.retry_after);
+// retryAfter == 0 means "back off and retry" (network blip / Telegram 5xx).
+type errRetryable struct {
+	err        error
+	retryAfter time.Duration
+}
+
+func (e *errRetryable) Error() string { return e.err.Error() }
+func (e *errRetryable) Unwrap() error { return e.err }
+
+// sendChunk sends one chunk, retrying transient failures. Telegram enforces
+// flood limits (HTTP 429 with parameters.retry_after) and occasionally 5xxs;
+// without this a burst of uploads surfaced those as hard 502s to the client.
+// data is already in memory, so each attempt simply rebuilds the multipart
+// body. Bounded attempts + ctx cancellation keep a wedged backend from
+// hanging the request forever.
 func (b *BotStorage) sendChunk(ctx context.Context, name, contentType string, seq int, data []byte) (storage.Chunk, error) {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ch, err := b.sendChunkOnce(ctx, name, contentType, seq, data)
+		if err == nil {
+			return ch, nil
+		}
+		lastErr = err
+		var re *errRetryable
+		if !errors.As(err, &re) || attempt == maxAttempts {
+			return storage.Chunk{}, err
+		}
+		wait := re.retryAfter
+		if wait <= 0 { // transient without an explicit hint: exponential backoff
+			wait = time.Duration(200*(1<<(attempt-1))) * time.Millisecond
+		}
+		if wait > 60*time.Second {
+			wait = 60 * time.Second
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return storage.Chunk{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return storage.Chunk{}, lastErr
+}
+
+// sendChunkOnce streams data (already in memory) as a multipart sendDocument
+// via an io.Pipe, so the request body is not copied into a second buffer. A
+// transient failure is returned wrapped in *errRetryable.
+func (b *BotStorage) sendChunkOnce(ctx context.Context, name, contentType string, seq int, data []byte) (storage.Chunk, error) {
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
@@ -119,7 +178,8 @@ func (b *BotStorage) sendChunk(ctx context.Context, name, contentType string, se
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return storage.Chunk{}, err
+		// Transport-level failure (connection reset, timeout): worth a retry.
+		return storage.Chunk{}, &errRetryable{err: err}
 	}
 	defer resp.Body.Close()
 
@@ -128,7 +188,21 @@ func (b *BotStorage) sendChunk(ctx context.Context, name, contentType string, se
 		return storage.Chunk{}, err
 	}
 	if resp.StatusCode >= 300 || !result.OK {
-		return storage.Chunk{}, fmt.Errorf("telegram sendDocument failed: %s", result.Description)
+		sendErr := fmt.Errorf("telegram sendDocument failed: %s", result.Description)
+		// 429 (flood control) carries parameters.retry_after; 5xx is a
+		// transient Telegram-side error. Both are retryable; a 4xx other
+		// than 429 (bad request) is permanent.
+		if resp.StatusCode == http.StatusTooManyRequests || result.ErrorCode == http.StatusTooManyRequests || result.Parameters.RetryAfter > 0 {
+			ra := time.Duration(result.Parameters.RetryAfter) * time.Second
+			if ra <= 0 {
+				ra = time.Second
+			}
+			return storage.Chunk{}, &errRetryable{err: sendErr, retryAfter: ra}
+		}
+		if resp.StatusCode >= 500 {
+			return storage.Chunk{}, &errRetryable{err: sendErr}
+		}
+		return storage.Chunk{}, sendErr
 	}
 	if result.Result.Document.FileID == "" {
 		return storage.Chunk{}, fmt.Errorf("telegram response did not include document file_id")
@@ -243,8 +317,12 @@ type baseResponse struct {
 
 type sendDocumentResponse struct {
 	OK          bool   `json:"ok"`
+	ErrorCode   int    `json:"error_code"`
 	Description string `json:"description"`
-	Result      struct {
+	Parameters  struct {
+		RetryAfter int `json:"retry_after"`
+	} `json:"parameters"`
+	Result struct {
 		MessageID int64 `json:"message_id"`
 		Document  struct {
 			FileID string `json:"file_id"`
