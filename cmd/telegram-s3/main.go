@@ -31,7 +31,7 @@ func main() {
 	}
 	defer store.Close()
 
-	backend := telegram.NewBotStorage(cfg.TelegramBotToken, cfg.TelegramChatID, logger)
+	backend := telegram.NewBotStorage(cfg.TelegramBotToken, cfg.TelegramChatID, cfg.TelegramAPIBaseURL, logger)
 	handler := s3api.NewHandler(cfg, store, backend, logger)
 
 	server := &http.Server{
