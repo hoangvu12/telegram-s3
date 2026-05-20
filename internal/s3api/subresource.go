@@ -6,15 +6,21 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+
+	"telegram-s3/internal/metadata"
 )
 
 // bucketSubresourceKeys are the bucket-config query subresources S3 clients
 // probe during connect/setup. "delete" is deliberately NOT here — that is the
 // bulk DeleteObjects POST (P7.2), a data operation, not a config subresource.
+// "versions" is also a *listing* op (cosmetic, unversioned shape) but is
+// routed via this gate so it precedes the v1/v2 listObjects fallthrough.
 var bucketSubresourceKeys = []string{
 	"location", "versioning", "acl", "cors", "tagging", "policy",
 	"lifecycle", "website", "encryption", "object-lock", "notification",
 	"logging", "replication", "accelerate", "requestPayment", "uploads",
+	"versions",
 	"ownershipControls", "publicAccessBlock", "analytics", "metrics",
 	"inventory", "intelligent-tiering",
 }
@@ -61,6 +67,12 @@ func (h *Handler) bucketSubresource(ctx context.Context, w http.ResponseWriter, 
 	switch {
 	case q.Has("uploads"):
 		h.listMultipartUploads(ctx, w, bucket)
+	case q.Has("versions"):
+		// ListObjectVersions on a bucket that never had versioning enabled —
+		// AWS returns the current objects as <Version> rows with VersionId=
+		// "null" and IsLatest=true. Real versioning is intentionally not
+		// implemented (P8.1 closes §6.14 cosmetic only).
+		h.listObjectVersions(ctx, w, r, bucket, q)
 	case q.Has("location"):
 		canned("LocationConstraint") // empty == us-east-1
 	case q.Has("versioning"):
@@ -142,4 +154,99 @@ type uploadEntry struct {
 	Key       string `xml:"Key"`
 	UploadID  string `xml:"UploadId"`
 	Initiated string `xml:"Initiated"`
+}
+
+// listObjectVersions renders the current objects as a ListVersionsResult with
+// a single null version per key (IsLatest=true). The bucket is unversioned, so
+// version-id-marker is ignored and DeleteMarkers never appear. Pagination
+// mirrors listObjects v1 via the key-marker / NextKeyMarker pair.
+func (h *Handler) listObjectVersions(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
+	prefix := q.Get("prefix")
+	delimiter := q.Get("delimiter")
+	keyMarker := q.Get("key-marker")
+	urlEncode := q.Get("encoding-type") == "url"
+	rawMax, _ := strconv.Atoi(q.Get("max-keys"))
+	maxKeys := maxKeysOrDefault(rawMax)
+
+	page, err := h.store.ListObjectsPage(ctx, metadata.ListParams{
+		Bucket: bucket, Prefix: prefix, Delimiter: delimiter, After: keyMarker, MaxKeys: maxKeys,
+	})
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
+		return
+	}
+
+	enc := func(s string) string {
+		if urlEncode && s != "" {
+			return awsURIEncode(s, true)
+		}
+		return s
+	}
+	encType := ""
+	if urlEncode {
+		encType = "url"
+	}
+
+	common := make([]commonPrefix, 0, len(page.CommonPrefixes))
+	for _, p := range page.CommonPrefixes {
+		common = append(common, commonPrefix{Prefix: enc(p)})
+	}
+	versions := make([]versionEntry, 0, len(page.Objects))
+	for _, obj := range page.Objects {
+		versions = append(versions, versionEntry{
+			Key:          enc(obj.Key),
+			VersionID:    "null",
+			IsLatest:     true,
+			LastModified: obj.UpdatedAt.UTC().Format(awsListTimeFormat),
+			ETag:         quoteETag(obj.ETag),
+			Size:         obj.Size,
+			StorageClass: "STANDARD",
+			Owner:        owner{ID: h.cfg.AccessKeyID, DisplayName: h.cfg.AccessKeyID},
+		})
+	}
+
+	res := listVersionsResult{
+		XMLNS:        s3XMLNS,
+		Name:         bucket,
+		Prefix:       enc(prefix),
+		KeyMarker:    enc(keyMarker),
+		MaxKeys:      maxKeys,
+		Delimiter:    enc(delimiter),
+		IsTruncated:  page.IsTruncated,
+		EncodingType: encType,
+		Versions:     versions,
+		Prefixes:     common,
+	}
+	if page.IsTruncated {
+		res.NextKeyMarker = enc(page.NextAfter)
+	}
+	h.writeXML(w, http.StatusOK, res)
+}
+
+type listVersionsResult struct {
+	XMLName             xml.Name       `xml:"ListVersionsResult"`
+	XMLNS               string         `xml:"xmlns,attr"`
+	Name                string         `xml:"Name"`
+	Prefix              string         `xml:"Prefix"`
+	KeyMarker           string         `xml:"KeyMarker"`
+	VersionIDMarker     string         `xml:"VersionIdMarker"`
+	NextKeyMarker       string         `xml:"NextKeyMarker,omitempty"`
+	NextVersionIDMarker string         `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int            `xml:"MaxKeys"`
+	Delimiter           string         `xml:"Delimiter,omitempty"`
+	IsTruncated         bool           `xml:"IsTruncated"`
+	EncodingType        string         `xml:"EncodingType,omitempty"`
+	Versions            []versionEntry `xml:"Version"`
+	Prefixes            []commonPrefix `xml:"CommonPrefixes"`
+}
+
+type versionEntry struct {
+	Key          string `xml:"Key"`
+	VersionID    string `xml:"VersionId"`
+	IsLatest     bool   `xml:"IsLatest"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
+	StorageClass string `xml:"StorageClass"`
+	Owner        owner  `xml:"Owner"`
 }

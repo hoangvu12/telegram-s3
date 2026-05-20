@@ -3,11 +3,18 @@ package s3api
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 )
+
+// ErrMalformedChunked marks any failure to de-frame an `aws-chunked` body
+// (8.3, closes §6.4). The caller wraps it in a 400 IncompleteBody so a
+// malformed frame surfaces as a client error rather than a TelegramUploadFailed
+// 502 (the Telegram backend's Upload error simply propagates this sentinel).
+var ErrMalformedChunked = errors.New("aws-chunked: malformed body")
 
 // isAWSChunked reports whether the request body is framed in the S3
 // `aws-chunked` content-encoding (a streaming upload). Both the unsigned and
@@ -61,7 +68,7 @@ func (c *awsChunkedReader) Read(p []byte) (int, error) {
 	c.remaining -= int64(n)
 	if err == io.EOF {
 		// Stream ended before the terminating 0-sized chunk.
-		err = io.ErrUnexpectedEOF
+		err = fmt.Errorf("%w: truncated chunk body", ErrMalformedChunked)
 	}
 	if c.remaining == 0 && err == nil {
 		err = c.consumeCRLF()
@@ -80,7 +87,7 @@ func (c *awsChunkedReader) readChunkSize() (int64, error) {
 	}
 	size, err := strconv.ParseInt(strings.TrimSpace(line), 16, 64)
 	if err != nil || size < 0 {
-		return 0, errors.New("aws-chunked: invalid chunk size")
+		return 0, fmt.Errorf("%w: invalid chunk size", ErrMalformedChunked)
 	}
 	return size, nil
 }
@@ -92,10 +99,10 @@ func (c *awsChunkedReader) readLine() (string, error) {
 	line, err := c.br.ReadSlice('\n')
 	if err != nil {
 		if err == bufio.ErrBufferFull {
-			return "", errors.New("aws-chunked: chunk header too long")
+			return "", fmt.Errorf("%w: chunk header too long", ErrMalformedChunked)
 		}
 		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
+			err = fmt.Errorf("%w: truncated chunk header", ErrMalformedChunked)
 		}
 		return "", err
 	}
@@ -106,12 +113,12 @@ func (c *awsChunkedReader) consumeCRLF() error {
 	var buf [2]byte
 	if _, err := io.ReadFull(c.br, buf[:]); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return io.ErrUnexpectedEOF
+			return fmt.Errorf("%w: missing chunk terminator", ErrMalformedChunked)
 		}
 		return err
 	}
 	if buf[0] != '\r' || buf[1] != '\n' {
-		return errors.New("aws-chunked: malformed chunk terminator")
+		return fmt.Errorf("%w: malformed chunk terminator", ErrMalformedChunked)
 	}
 	return nil
 }

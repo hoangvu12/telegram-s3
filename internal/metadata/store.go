@@ -522,6 +522,37 @@ func (s *Store) ListMultipartUploads(ctx context.Context, bucket string) ([]Mult
 	return uploads, rows.Err()
 }
 
+// SetMultipartCreatedAt overrides a multipart upload's created_at timestamp.
+// Production never edits created_at after CreateMultipartUpload; this exists
+// only so the P8.6 janitor tests can stage a "stale" upload without sleeping
+// for the real TTL.
+func (s *Store) SetMultipartCreatedAt(ctx context.Context, uploadID string, t time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE multipart_uploads SET created_at = ? WHERE upload_id = ?`, t.UTC().Format(time.RFC3339Nano), uploadID)
+	return err
+}
+
+// StaleMultipartUploads returns every multipart upload whose created_at is
+// strictly before the cutoff. Used by the P8.6 janitor; uploads within the
+// TTL window are left alone (they may be live in-progress writes).
+func (s *Store) StaleMultipartUploads(ctx context.Context, before time.Time) ([]MultipartUpload, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE created_at < ? ORDER BY created_at`, before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var uploads []MultipartUpload
+	for rows.Next() {
+		var u MultipartUpload
+		var created string
+		if err := rows.Scan(&u.UploadID, &u.Bucket, &u.Key, &u.ContentType, &created); err != nil {
+			return nil, err
+		}
+		u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		uploads = append(uploads, u)
+	}
+	return uploads, rows.Err()
+}
+
 func (s *Store) GetMultipartPartChunks(ctx context.Context, uploadID string, partNumber int) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT seq, telegram_file_id, telegram_message_id, size FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
 	if err != nil {

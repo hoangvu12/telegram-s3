@@ -166,6 +166,107 @@ func TestMultipartMetadataCarry(t *testing.T) {
 	}
 }
 
+// 8.4: x-amz-checksum-* headers are persisted at PUT and echoed verbatim on
+// GET/HEAD. The body is NOT re-verified server-side; this is a parity feature.
+func TestChecksumHeadersEcho(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	rec := doWithHeaders(r, http.MethodPut, "/send/k", []byte("hello"), map[string]string{
+		"x-amz-checksum-crc32":     "AAAAAA==",
+		"x-amz-checksum-algorithm": "CRC32",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body)
+	}
+	for _, m := range []string{http.MethodGet, http.MethodHead} {
+		rec := reqWith(r, m, "/send/k", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", m, rec.Code, rec.Body)
+		}
+		if got := rec.Header().Get("X-Amz-Checksum-Crc32"); got != "AAAAAA==" {
+			t.Fatalf("%s X-Amz-Checksum-Crc32 = %q", m, got)
+		}
+		if got := rec.Header().Get("X-Amz-Checksum-Algorithm"); got != "CRC32" {
+			t.Fatalf("%s X-Amz-Checksum-Algorithm = %q", m, got)
+		}
+	}
+}
+
+func TestChecksumHeadersAbsent(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+	doWithHeaders(r, http.MethodPut, "/send/k", []byte("hi"), nil)
+	rec := reqWith(r, http.MethodGet, "/send/k", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: %d", rec.Code)
+	}
+	// An object without any checksum headers must not emit empty placeholders.
+	for _, k := range []string{
+		"X-Amz-Checksum-Crc32", "X-Amz-Checksum-Crc32c",
+		"X-Amz-Checksum-Sha1", "X-Amz-Checksum-Sha256",
+		"X-Amz-Checksum-Algorithm",
+	} {
+		if v := rec.Header().Get(k); v != "" {
+			t.Fatalf("%s should be absent, got %q", k, v)
+		}
+	}
+}
+
+// 8.4 (multipart): a checksum on CreateMultipartUpload rides
+// multipart_upload_metadata onto the finalized object, exactly like
+// Content-Disposition / x-amz-meta-* already do.
+func TestChecksumHeadersMultipartCarry(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	rec := doWithHeaders(r, http.MethodPost, "/send/m?uploads", nil, map[string]string{
+		"x-amz-checksum-sha256":    "abc123=",
+		"x-amz-checksum-algorithm": "SHA256",
+	})
+	var init initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &init); err != nil || init.UploadID == "" {
+		t.Fatalf("create mpu: %v body=%s", err, rec.Body)
+	}
+	uid := init.UploadID
+
+	part := []byte("multipart body data")
+	pr := r.do(http.MethodPut, fmt.Sprintf("/send/m?partNumber=1&uploadId=%s", uid), part)
+	if pr.Code != http.StatusOK {
+		t.Fatalf("upload part: %d %s", pr.Code, pr.Body)
+	}
+	pe := pr.Header().Get("ETag")
+	body := fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, pe)
+	if cr := r.do(http.MethodPost, "/send/m?uploadId="+uid, []byte(body)); cr.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", cr.Code, cr.Body)
+	}
+
+	hd := reqWith(r, http.MethodGet, "/send/m", nil)
+	if hd.Code != http.StatusOK {
+		t.Fatalf("get: %d", hd.Code)
+	}
+	if hd.Header().Get("X-Amz-Checksum-Sha256") != "abc123=" {
+		t.Fatalf("checksum not carried: %v", hd.Header())
+	}
+	if hd.Header().Get("X-Amz-Checksum-Algorithm") != "SHA256" {
+		t.Fatalf("algorithm not carried: %v", hd.Header())
+	}
+}
+
+// Regression: x-amz-meta-* still works after the checksum capture is added.
+func TestChecksumHeadersRegressionAmzMeta(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	doWithHeaders(r, http.MethodPut, "/send/k", []byte("v"), map[string]string{
+		"X-Amz-Meta-Foo": "bar",
+	})
+	hd := reqWith(r, http.MethodHead, "/send/k", nil)
+	if hd.Header().Get("X-Amz-Meta-Foo") != "bar" {
+		t.Fatalf("x-amz-meta-* lost: %v", hd.Header())
+	}
+}
+
 func TestCopyMetadataDirective(t *testing.T) {
 	r := newMPRig(t)
 	seedBucket(t, r)

@@ -239,6 +239,14 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 	body, hasher := decodeUpload(r)
 	chunks, err := h.backend.Upload(ctx, key, contentType, body)
 	if err != nil {
+		// Malformed aws-chunked framing (8.3) is a client error, not a
+		// backend failure — map to 400 before the 502 fallthrough. The
+		// backend may have already pushed some bytes; reap them.
+		if errors.Is(err, ErrMalformedChunked) {
+			h.deleteChunks(ctx, chunks)
+			h.writeError(w, http.StatusBadRequest, "IncompleteBody", "The request body does not match the declared chunk framing.")
+			return
+		}
 		h.writeError(w, http.StatusBadGateway, "TelegramUploadFailed", err.Error())
 		return
 	}
@@ -256,13 +264,41 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 		obj.TelegramFileID = chunks[0].FileID
 		obj.TelegramMessageID = chunks[0].MessageID
 	}
+
+	// Read the prior version's Telegram references BEFORE PutObject — the
+	// txn replaces object_chunks in place, so afterwards the old rows are
+	// gone (8.5, closes §6.1). prev is a legacy fallback: a pre-Phase-3
+	// row has no object_chunks but a non-zero TelegramMessageID.
+	oldChunks, _ := h.store.GetObjectChunks(ctx, bucket, key)
+	prev, _ := h.store.GetObject(ctx, bucket, key)
+
 	if err := h.store.PutObject(ctx, obj, toMetaChunks(chunks)); err != nil {
 		h.deleteChunks(ctx, chunks)
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
+	h.reapSupersededChunks(ctx, oldChunks, prev)
 	w.Header().Set("ETag", quoteETag(etag))
 	w.WriteHeader(http.StatusOK)
+}
+
+// reapSupersededChunks best-effort drops the previous version's Telegram
+// messages after a successful overwrite. A failure here is logged but never
+// 5xx's the now-durable write — the new object is already authoritative.
+func (h *Handler) reapSupersededChunks(ctx context.Context, oldChunks []metadata.Chunk, prev metadata.Object) {
+	for _, c := range oldChunks {
+		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
+			h.logger.Warn("reap superseded chunk failed", "message_id", c.MessageID, "error", derr)
+		}
+	}
+	// Legacy single-message row (pre-Phase-3): no object_chunks rows but a
+	// non-zero TelegramMessageID. Reap that one too. Empty objects (Size==0)
+	// never had a Telegram message, so skip them.
+	if len(oldChunks) == 0 && prev.Size > 0 && prev.TelegramMessageID != 0 {
+		if derr := h.backend.Delete(ctx, prev.TelegramMessageID); derr != nil && h.logger != nil {
+			h.logger.Warn("reap legacy superseded object failed", "message_id", prev.TelegramMessageID, "error", derr)
+		}
+	}
 }
 
 // decodeUpload wraps the request body so the caller reads decoded object

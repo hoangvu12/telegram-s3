@@ -2,12 +2,15 @@ package s3api
 
 import (
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- framing helpers -------------------------------------------------------
@@ -169,19 +172,20 @@ func TestAWSChunkedReader_EOFStable(t *testing.T) {
 }
 
 // ---- corruption must be rejected, never silently accepted ------------------
-
+//
+// 8.3: every framing failure surfaces as ErrMalformedChunked so callers
+// (putObject/uploadPart) can map it to a 400 instead of a 502.
 func TestAWSChunkedReader_Errors(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
-		want error // errors.Is target, or nil to just require non-nil
 	}{
-		{"data shorter than declared size", "64\r\n" + strings.Repeat("a", 50), io.ErrUnexpectedEOF},
-		{"missing terminating 0-chunk", unsignedChunk([]byte("abc")), io.ErrUnexpectedEOF},
-		{"truncated header (no newline)", "10", io.ErrUnexpectedEOF},
-		{"missing CRLF after data", "3\r\nabc", io.ErrUnexpectedEOF},
-		{"malformed chunk terminator", "3\r\nabcXX0\r\n\r\n", nil},
-		{"invalid hex chunk size", "zz\r\nabc\r\n0\r\n\r\n", nil},
+		{"data shorter than declared size", "64\r\n" + strings.Repeat("a", 50)},
+		{"missing terminating 0-chunk", unsignedChunk([]byte("abc"))},
+		{"truncated header (no newline)", "10"},
+		{"missing CRLF after data", "3\r\nabc"},
+		{"malformed chunk terminator", "3\r\nabcXX0\r\n\r\n"},
+		{"invalid hex chunk size", "zz\r\nabc\r\n0\r\n\r\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -189,8 +193,8 @@ func TestAWSChunkedReader_Errors(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected an error, got nil (silent corruption!)")
 			}
-			if c.want != nil && !errors.Is(err, c.want) {
-				t.Fatalf("error = %v, want errors.Is %v", err, c.want)
+			if !errors.Is(err, ErrMalformedChunked) {
+				t.Fatalf("error = %v, want errors.Is ErrMalformedChunked", err)
 			}
 		})
 	}
@@ -207,6 +211,63 @@ func TestCountingReader(t *testing.T) {
 	}
 	if n != 12345 || c.n != 12345 {
 		t.Fatalf("counted %d (io.Copy %d), want 12345", c.n, n)
+	}
+}
+
+// 8.3: a PUT whose body is malformed aws-chunked must surface as
+// 400 IncompleteBody (the previous behavior, 502 TelegramUploadFailed,
+// misled clients into retrying a permanent client error).
+func TestPutObjectMalformedChunkedReturns400(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	garbage := []byte("zz\r\nabc\r\n0\r\n\r\n") // invalid hex chunk size
+	req := httptest.NewRequest(http.MethodPut, "http://example.com/send/k", bytes.NewReader(garbage))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	signHeaderAuth(req, amz(time.Now().UTC()))
+	rec := httptest.NewRecorder()
+	r.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400 (body %s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "IncompleteBody") {
+		t.Fatalf("expected IncompleteBody, got %s", rec.Body)
+	}
+	// The malformed body must not leave a corrupt object behind.
+	r.be.mu.Lock()
+	live := len(r.be.files)
+	r.be.mu.Unlock()
+	if live != 0 {
+		t.Fatalf("malformed chunked PUT left %d backend files", live)
+	}
+}
+
+// 8.3 (multipart): same mapping on UploadPart.
+func TestUploadPartMalformedChunkedReturns400(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	var init initiateMultipartUploadResult
+	if err := xml.Unmarshal(r.do(http.MethodPost, "/send/k?uploads", nil).Body.Bytes(), &init); err != nil {
+		t.Fatalf("create mpu: %v", err)
+	}
+	uid := init.UploadID
+
+	garbage := []byte("zz\r\nabc\r\n0\r\n\r\n")
+	req := httptest.NewRequest(http.MethodPut, "http://example.com/send/k?partNumber=1&uploadId="+uid, bytes.NewReader(garbage))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	signHeaderAuth(req, amz(time.Now().UTC()))
+	rec := httptest.NewRecorder()
+	r.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400 (body %s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "IncompleteBody") {
+		t.Fatalf("expected IncompleteBody, got %s", rec.Body)
 	}
 }
 

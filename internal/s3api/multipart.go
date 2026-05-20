@@ -16,6 +16,11 @@ import (
 	"telegram-s3/internal/metadata"
 )
 
+// minPartSize is the AWS S3 minimum size for any multipart part **except the
+// last** (the last part can be any size). CompleteMultipartUpload rejects
+// undersized non-last parts with EntityTooSmall (8.2 closes §6.3).
+const minPartSize = 5 * 1024 * 1024
+
 func newUploadID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
@@ -102,6 +107,12 @@ func (h *Handler) uploadPart(ctx context.Context, w http.ResponseWriter, r *http
 	body, hasher := decodeUpload(r)
 	chunks, err := h.backend.Upload(ctx, key, u.ContentType, body)
 	if err != nil {
+		// Same 400 mapping as putObject for malformed aws-chunked (8.3).
+		if errors.Is(err, ErrMalformedChunked) {
+			h.deleteChunks(ctx, chunks)
+			h.writeError(w, http.StatusBadRequest, "IncompleteBody", "The request body does not match the declared chunk framing.")
+			return
+		}
 		h.writeError(w, http.StatusBadGateway, "TelegramUploadFailed", err.Error())
 		return
 	}
@@ -159,7 +170,7 @@ func (h *Handler) completeMultipartUpload(ctx context.Context, w http.ResponseWr
 		seq         int
 		prevPart    int
 	)
-	for _, cp := range req.Parts {
+	for i, cp := range req.Parts {
 		if cp.PartNumber <= prevPart { // strictly ascending, no dups
 			h.writeError(w, http.StatusBadRequest, "InvalidPartOrder", "The list of parts was not in ascending order.")
 			return
@@ -168,6 +179,11 @@ func (h *Handler) completeMultipartUpload(ctx context.Context, w http.ResponseWr
 		sp, present := storedByNum[cp.PartNumber]
 		if !present || !strings.EqualFold(strings.Trim(cp.ETag, `"`), sp.ETag) {
 			h.writeError(w, http.StatusBadRequest, "InvalidPart", "One or more of the specified parts could not be found or the ETag did not match.")
+			return
+		}
+		// AWS rule: only the LAST part may be smaller than 5 MiB.
+		if i != len(req.Parts)-1 && sp.Size < minPartSize {
+			h.writeError(w, http.StatusBadRequest, "EntityTooSmall", "Your proposed upload is smaller than the minimum allowed size.")
 			return
 		}
 		raw, derr := hex.DecodeString(sp.ETag)
@@ -200,10 +216,18 @@ func (h *Handler) completeMultipartUpload(ctx context.Context, w http.ResponseWr
 		obj.TelegramFileID = finalChunks[0].FileID
 		obj.TelegramMessageID = finalChunks[0].MessageID
 	}
+
+	// Same overwrite-reap pattern as putObject (8.5): capture the prior
+	// version BEFORE the finalize txn replaces it in object_chunks, reap
+	// AFTER the txn commits.
+	oldChunks, _ := h.store.GetObjectChunks(ctx, bucket, key)
+	prev, _ := h.store.GetObject(ctx, bucket, key)
+
 	if err := h.store.FinalizeMultipartUpload(ctx, obj, finalChunks, uploadID); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
+	h.reapSupersededChunks(ctx, oldChunks, prev)
 
 	h.writeXML(w, http.StatusOK, completeMultipartUploadResult{
 		Location: "/" + bucket + "/" + key,
@@ -217,21 +241,27 @@ func (h *Handler) abortMultipartUpload(ctx context.Context, w http.ResponseWrite
 	if _, ok := h.resolveUpload(ctx, w, bucket, key, uploadID); !ok {
 		return
 	}
-	all, err := h.store.AllMultipartChunks(ctx, uploadID)
-	if err != nil {
+	if err := h.abortUploadInternal(ctx, uploadID); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// abortUploadInternal reaps the Telegram messages tied to a multipart upload
+// and removes its bookkeeping. Shared by the HTTP abort handler and the P8.6
+// janitor (which has no bucket/key context, only the upload_id).
+func (h *Handler) abortUploadInternal(ctx context.Context, uploadID string) error {
+	all, err := h.store.AllMultipartChunks(ctx, uploadID)
+	if err != nil {
+		return err
 	}
 	for _, c := range all {
 		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
 			h.logger.Warn("abort: delete part chunk failed", "message_id", c.MessageID, "error", derr)
 		}
 	}
-	if err := h.store.DeleteMultipartUpload(ctx, uploadID); err != nil {
-		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	return h.store.DeleteMultipartUpload(ctx, uploadID)
 }
 
 func (h *Handler) listParts(ctx context.Context, w http.ResponseWriter, bucket, key, uploadID string) {

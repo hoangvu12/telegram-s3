@@ -16,6 +16,16 @@ var metadataHeaders = []string{
 	"Content-Disposition", "Content-Encoding", "Cache-Control", "Expires",
 }
 
+// checksumHeaders are the AWS flexible-checksum headers (P8.4). They are
+// captured at PUT/UploadPart and echoed on GET/HEAD; the body is **not**
+// verified server-side (matches the chunked trailer's existing behavior in
+// chunked.go:49). The algorithm hint travels with them.
+var checksumHeaders = []string{
+	"x-amz-checksum-crc32", "x-amz-checksum-crc32c",
+	"x-amz-checksum-sha1", "x-amz-checksum-sha256",
+	"x-amz-checksum-algorithm",
+}
+
 // captureObjectMetadata extracts the persisted system headers plus every
 // x-amz-meta-* header (name lower-cased, value verbatim) from a PUT/Copy/MPU
 // request. Returns nil when there is nothing to store (legacy-equivalent).
@@ -24,6 +34,11 @@ func captureObjectMetadata(h http.Header) map[string]string {
 	for _, name := range metadataHeaders {
 		if v := h.Get(name); v != "" {
 			md[strings.ToLower(name)] = v
+		}
+	}
+	for _, name := range checksumHeaders {
+		if v := h.Get(name); v != "" {
+			md[name] = v
 		}
 	}
 	for name, vals := range h {
@@ -78,6 +93,13 @@ func applyObjectHeaders(w http.ResponseWriter, q url.Values, obj metadata.Object
 	echo("expires", "Expires", "response-expires")
 	for k, v := range md {
 		if strings.HasPrefix(k, "x-amz-meta-") {
+			w.Header().Set(k, v)
+		}
+	}
+	// Echo P8.4 checksum headers (algorithm hint + per-algo digest). Stored
+	// values are already lower-cased; net/http normalizes the wire form.
+	for k, v := range md {
+		if strings.HasPrefix(k, "x-amz-checksum-") {
 			w.Header().Set(k, v)
 		}
 	}

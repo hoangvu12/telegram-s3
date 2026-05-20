@@ -34,6 +34,14 @@ func main() {
 	backend := telegram.NewBotStorage(cfg.TelegramBotToken, cfg.TelegramChatID, cfg.TelegramAPIBaseURL, logger)
 	handler := s3api.NewHandler(cfg, store, backend, logger)
 
+	// Abandoned-multipart janitor (P8.6). Skipped if the sweep is disabled
+	// (interval <= 0). Stops with the server on SIGINT/SIGTERM.
+	janitorCtx, cancelJanitor := context.WithCancel(context.Background())
+	defer cancelJanitor()
+	if cfg.MultipartSweepInterval > 0 {
+		go handler.RunMultipartJanitor(janitorCtx, cfg.MultipartSweepInterval, cfg.MultipartTTL)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
@@ -52,6 +60,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
+	cancelJanitor()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {

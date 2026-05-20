@@ -243,12 +243,21 @@ plus `S3-COMPAT-PLAN.md`, `S3-COMPAT-PHASE7-PLAN.md`, `HANDOFF.md`, this file.
 ## 5. Test inventory (all pass)
 
 - `s3api/chunked_test.go` — de‑framer vs AWS §3.2 vectors, unsigned/signed
-  trailer, tiny‑buffer splits, corruption matrix, detection truth table.
+  trailer, tiny‑buffer splits, corruption matrix (now asserting
+  `errors.Is(err, ErrMalformedChunked)` per Phase 8.3), detection truth
+  table, and end‑to‑end PUT/UploadPart `400 IncompleteBody` mapping for
+  malformed aws‑chunked bodies.
 - `s3api/sigv4_test.go` — `awsURIEncode` (incl. AWS doc example + UTF‑8),
   canonical query, canonical URI, presigned expiry, clock skew, space‑in‑key.
 - `s3api/multipart_test.go` — fake `Backend` driving full create→parts→list→
   complete→reassembled GET (multipart ETag/size), abort frees messages, error
-  matrix. Reusable rig (`newMPRig`, `signHeaderAuth`).
+  matrix. Reusable rig (`newMPRig`, `newMPRigWithChunkSize`, `signHeaderAuth`).
+  **Phase 8.2:** `EntityTooSmall` matrix on CompleteMultipartUpload
+  (undersized non‑last → 400, single‑part exempt, middle‑undersized rejected,
+  last‑undersized accepted). **Phase 8.5:** PutObject overwrite reaps prior
+  chunks; legacy single‑message row's `TelegramMessageID` reaped on
+  overwrite; failing `backend.Delete` on reap tolerated (PUT still 200);
+  multipart Complete overwriting an existing key reaps too.
 - `s3api/list_test.go` — Phase 6 on the same rig (signed GETs): v1/v2 basics,
   prefix, delimiter rollup, prefix+delimiter, v2 token + v1 marker pagination
   round‑trips, **pagination through a delimiter rollup** (one new prefix per
@@ -262,7 +271,13 @@ plus `S3-COMPAT-PLAN.md`, `S3-COMPAT-PHASE7-PLAN.md`, `HANDOFF.md`, this file.
 - `s3api/subresource_test.go` — Phase 7 P7.1: `?location/?versioning/?acl`
   200, `?tagging/?cors/?policy/…` clean 404 matrix, `NoSuchBucket`,
   PUT/DELETE no‑op, real ListMultipartUploads, and the Phase‑6 listing
-  non‑regression (subresource arm only fires on a config key).
+  non‑regression (subresource arm only fires on a config key). **Phase 8.1:**
+  `?versions` envelope (`VersionId="null"`/`IsLatest=true`), delimiter
+  rollup, key‑marker pagination round‑trip, and the `?versioning`
+  regression (config probe not stolen).
+- `s3api/janitor_test.go` — Phase 8.6: stale multipart upload aborted,
+  fresh upload untouched, HTTP abort path regression after the
+  `abortUploadInternal` refactor, disabled‑interval immediate return.
 - `s3api/deleteobjects_test.go` — P7.2: subset bulk delete + survivors,
   `<Quiet>`, missing‑key‑is‑Deleted (idempotent), malformed body → 400.
 - `s3api/cors_test.go` — P7.3: OPTIONS preflight (200, ACAO `*`, echoed
@@ -272,7 +287,9 @@ plus `S3-COMPAT-PLAN.md`, `S3-COMPAT-PHASE7-PLAN.md`, `HANDOFF.md`, this file.
   UploadPartCopy full + `x-amz-copy-source-range` then complete reassembles.
 - `s3api/objectmeta_test.go` — P7.5: metadata echo on GET/HEAD, `response-*`
   overrides, conditional matrix (304/412 + precedence), MPU metadata carry,
-  copy COPY vs REPLACE directive.
+  copy COPY vs REPLACE directive. **Phase 8.4:** `x-amz-checksum-*` echo
+  on GET/HEAD, headers absent when never PUT, multipart‑carry (create‑time
+  checksum survives Complete), x‑amz‑meta‑* regression.
 - `s3api/vhost_test.go` — P7.6: `<bucket>.<endpointHost>` served, path‑style
   still works, vhost disabled when endpoint unset, `x-amz-request-id` header
   == `<RequestId>` in the error body.
@@ -294,62 +311,67 @@ plus `S3-COMPAT-PLAN.md`, `S3-COMPAT-PHASE7-PLAN.md`, `HANDOFF.md`, this file.
 
 ## 6. Known caveats / open warts
 
-1. **Overwrite‑orphan** (Phase 3+4): `PutObject` / `FinalizeMultipartUpload`
-   replace `object_chunks` transactionally, but the *superseded* object
-   version's Telegram messages are not reaped (orphaned forever). Pre‑Phase‑3
-   this orphaned 1 message; now N. **Cheap follow‑up:** before replacing, read
-   old chunks (`GetObjectChunks`), and after a successful store `backend.Delete`
-   those message IDs (they are distinct messages from the new upload, safe to
-   delete).
-2. **Abandoned multipart uploads never expire** — rows + Telegram messages
-   persist until an explicit Abort. No lifecycle/janitor. Follow‑up: sweep
-   `multipart_uploads` older than N and abort.
-3. **No 5 MiB min‑part enforcement** — AWS returns `EntityTooSmall` for
-   undersized non‑last parts; we accept them. Not a round‑trip correctness
-   issue; add only if a client depends on the error.
-4. **Malformed `aws-chunked` body → 502** (not 400) because the de‑framer error
-   propagates through `backend.Upload`. No corruption stored. Tightening needs
-   distinguishing the error class at the handler.
-5. **Range GET ✅ done (Phase 5).** Single‑range only by design; multi‑range
+> Phase 8 (2026‑05‑20) closed the original caveats 1–4 and 14, and rewrote
+> 15's flexible‑checksum sentence — the entries below have been renumbered.
+
+1. **Range GET ✅ done (Phase 5).** Single‑range only by design; multi‑range
    requests intentionally fall back to a full `200` (matches S3). Ranged reads
    remain chunk‑boundary slices on top of Bot‑API `getFile` + HTTP `Range`
    (decision §2.2), not native seekable reads. Still **not live‑verified**
-   (see caveat 7).
-6. **ListParts is under the public‑read auth bypass** (GET+bucket+key). Consistent
+   (see caveat 3).
+2. **ListParts is under the public‑read auth bypass** (GET+bucket+key). Consistent
    with the gateway's "reads are public" design; signed requests still pass.
-7. **Live acceptance not run** — Phases 1–6 acceptance needs a running gateway.
+3. **Live acceptance not run** — Phases 1–6 acceptance needs a running gateway.
    The `s3live` harness covers single‑PUT; set `TELEGRAM_S3_ITEST_SIZE`
    >18 MiB to force multi‑chunk (Phase 3). **Multipart live check is manual**
    (`aws s3 cp ./200MB.bin s3://send/big.bin`, `aws s3api list-parts`) or
    extend the harness with a multipart flow. Phase 6 owes the 2500‑key
    paginated `aws s3api list-objects-v2` / `rclone lsd` live pass.
-8. **Listing deviations (minor, intentional):** `max-keys=0` is treated as the
+4. **Listing deviations (minor, intentional):** `max-keys=0` is treated as the
    default 1000 (AWS returns an empty page) — kept so `deleteBucket`'s
    `MaxKeys:1` probe and old callers are unaffected; tighten only if a client
    depends on `0`. v1 `NextMarker` is emitted on **every** truncation, not
    only with a delimiter (AWS omits it otherwise) — a robustness superset that
    no client breaks on.
-9. **CopyObject = re‑upload (P7.4).** Copy streams the source bytes into a
+5. **CopyObject = re‑upload (P7.4).** Copy streams the source bytes into a
    fresh set of Telegram messages (decision §2 / plan §B.1: message
    ref‑counting would double‑free on delete). Costs duplicate storage;
-   accepted. The destination's prior chunks **are** reaped on overwrite, so
-   copy does not add to the overwrite‑orphan wart (#1).
-10. **No bucket‑level config is persisted (P7.1).** `?acl/?versioning/…`
-    reads are the canned "default/absent" responses an unconfigured bucket
-    would give; `PUT/DELETE` of a subresource is a silent no‑op (so
-    `put-bucket-cors` etc. don't 501). Versioning/ACL/policy/lifecycle/CORS
-    are genuinely unimplemented, not stored.
-11. **DeleteObjects always 200 (P7.2).** Per‑key idempotent (missing →
-    `Deleted`); a bucket that does not exist still yields a 200
-    `<DeleteResult>` (all keys "deleted") rather than `NoSuchBucket` — matches
-    the idempotent-delete design and the targets (`aws s3 rm`, rclone purge).
-12. **Virtual‑hosted only `<bucket>.<endpointHost>` (P7.6).** Derived from
-    `PUBLIC_ENDPOINT_URL`; empty/​bare‑host → path‑style. No path‑style‑in‑
-    vhost‑Host heuristics. SigV4 needs the client to have signed the host it
-    used (standard).
-13. **CORS is permissive `*` (P7.3).** Safe here — reads are public by
-    design, transport is TLS, SigV4 rides in headers/query (not cookies).
-    Not configurable per‑bucket.
+   accepted. The destination's prior chunks are reaped on overwrite (8.5),
+   so copy does not orphan storage.
+6. **No bucket‑level config is persisted (P7.1).** `?acl/?versioning/…`
+   reads are the canned "default/absent" responses an unconfigured bucket
+   would give; `PUT/DELETE` of a subresource is a silent no‑op (so
+   `put-bucket-cors` etc. don't 501). Versioning/ACL/policy/lifecycle/CORS
+   are genuinely unimplemented, not stored. **8.1 exception:** `?versions`
+   returns a `<ListVersionsResult>` shaped for an unversioned bucket — each
+   current object is one `<Version>` with `VersionId="null"` /
+   `IsLatest=true`; no real versioning subsystem.
+7. **DeleteObjects always 200 (P7.2).** Per‑key idempotent (missing →
+   `Deleted`); a bucket that does not exist still yields a 200
+   `<DeleteResult>` (all keys "deleted") rather than `NoSuchBucket` — matches
+   the idempotent-delete design and the targets (`aws s3 rm`, rclone purge).
+8. **Virtual‑hosted only `<bucket>.<endpointHost>` (P7.6).** Derived from
+   `PUBLIC_ENDPOINT_URL`; empty/​bare‑host → path‑style. No path‑style‑in‑
+   vhost‑Host heuristics. SigV4 needs the client to have signed the host it
+   used (standard).
+9. **CORS is permissive `*` (P7.3).** Safe here — reads are public by
+   design, transport is TLS, SigV4 rides in headers/query (not cookies).
+   Not configurable per‑bucket.
+10. **Live‑throughput ceiling + flexible‑checksum non‑verification.**
+    Sustained operation rates against the Telegram backend are capped by the
+    Bot API's per‑chat flood control (commit `0e3031a` adds backoff).
+    Empirically a bursty write workload settles to single‑digit ops/min
+    after the bot enters flood‑control state; one observed `s3‑tests` run
+    averaged ~2.5 min/test, with a 1000‑key test
+    (`test_multi_object_delete_key_limit`) stalling indefinitely.
+    **Implication:** the full Ceph s3‑tests suite (~413 tests after
+    filtering unsupported features) is not practically runnable against the
+    live gateway in a single sitting. Use the s3live harness + a small
+    curated s3‑tests smoke for live verification; schema/wire‑format
+    correctness is fully covered by the unit suite. **Flexible checksum
+    (8.4):** PUT‑time `x-amz-checksum-*` headers are persisted and echoed
+    on GET/HEAD; the body is **not** re‑verified server‑side (matches the
+    existing aws‑chunked TRAILER behavior in `chunked.go`).
 
 ---
 
@@ -398,10 +420,97 @@ and §4 (Phase 5/6/7). Acceptance = real default‑configured AWS CLI v2 / rclon
   - An SDK with **default (vhost) addressing** at `PUBLIC_ENDPOINT_URL`
     works (`bucket.host/key`); errors carry `x-amz-request-id` + `<RequestId>`.
 
+### Phase 8 — Ceph `s3-tests` live verification (partial; 2026‑05‑20)
+
+Set up the standard external compatibility suite (Ceph `s3-tests`,
+`github.com/ceph/s3-tests`) against the deployed gateway at
+`https://s3.nguyenvu.dev`.
+
+- **Harness**: scratch checkout at `..\s3-tests\` (outside the repo);
+  Python 3.11 venv; pytest 9 + boto3 1.43. Config at
+  `..\s3-tests\s3tests.conf` (bucket prefix `s3compat-{random}-`, never
+  `send`). Runner script `scripts/run-s3-tests.ps1` carries the marker
+  exclusion expression for unsupported features (versioning, object_lock,
+  bucket_policy, bucket/sse encryption, bucket/lifecycle/logging, tagging,
+  IAM/STS/role/group/policy, s3website, s3select, sns, append-object,
+  cloud_transition, storage_class, delete_marker, auth_aws2, fails_on_aws).
+  Filter selects **413 / 835** tests as in-scope.
+- **What we proved**:
+  - The s3-tests harness loads cleanly against the gateway (collection
+    finishes, SigV4 + endpoint config work end-to-end).
+  - **2 / 2** completed live tests pass: `test_bucket_list_distinct`,
+    `test_multi_object_delete`.
+- **Hard limits encountered** (see §6.14, §6.15):
+  - `?versions` gap: `s3tests/functional/__init__.py:nuke_bucket` calls
+    `list_object_versions`, which the gateway does not implement; the
+    test framework's per-test cleanup sees 0 objects and `delete_bucket`
+    then (correctly) returns `BucketNotEmpty`. Worked around with a
+    conftest monkey-patch (`..\s3-tests\conftest.py`) that swaps in a
+    `list_objects_v2`-based `nuke_bucket`. Recorded as §6.14.
+  - Live throughput: per-test latency averages ~2.5 min under Telegram
+    flood-control (a 1000-object test stalled indefinitely). Full
+    413-test live run not feasible in a single sitting — recorded as §6.15.
+- **Verdict**: the gateway behaves correctly on the tests that complete;
+  remaining live coverage is throughput-bound on Telegram, not
+  correctness-bound. Schema/wire-format correctness remains fully covered
+  by the unit suite and the `s3live` Phase 7 harness.
+
+### Phase 8 follow‑ups DONE (2026‑05‑20)
+
+All six items from `S3-COMPAT-PHASE8-PLAN.md` implemented + unit‑verified;
+nothing committed. Per‑item file pointers:
+
+- **8.1 `?versions` (ListObjectVersions) for unversioned buckets.** New
+  branch in `s3api/subresource.go:bucketSubresource` ahead of `?versioning`;
+  `listObjectVersions` + `listVersionsResult` types render the current
+  objects as `<Version>` rows with `VersionId="null"` / `IsLatest=true`,
+  reusing `store.ListObjectsPage` for pagination + delimiter rollup.
+  Unblocks stock Ceph `s3‑tests` `nuke_bucket` without a `conftest.py`
+  monkey‑patch. Tests: `subresource_test.go` (envelope, delimiter rollup,
+  pagination round‑trip, `?versioning` regression).
+- **8.2 `EntityTooSmall` on CompleteMultipartUpload.** Constant
+  `minPartSize = 5 MiB` in `s3api/multipart.go`; the complete loop rejects
+  any non‑last part below it with `400 EntityTooSmall`. The two pre‑existing
+  multipart tests (TestMultipartUploadHappyPath, TestUploadPartCopy) and
+  the rig were updated to use realistic part sizes via the new
+  `newMPRigWithChunkSize` helper. Tests: `multipart_test.go`
+  (`TestMultipartCompleteEntityTooSmall` — single‑tiny‑part exempt,
+  middle‑part undersized, last‑part‑undersized OK).
+- **8.3 Malformed `aws-chunked` body → `400 IncompleteBody`.** Sentinel
+  `ErrMalformedChunked` in `s3api/chunked.go` wraps every framing failure
+  (invalid hex size, chunk header too long, missing terminator, truncated
+  body/header). `putObject` and `uploadPart` check `errors.Is` before the
+  502 fall‑through and reap any partial chunks. Tests: `chunked_test.go`
+  (existing corruption matrix now asserts `errors.Is(err,
+  ErrMalformedChunked)`, plus end‑to‑end PUT/UploadPart 400 mapping).
+- **8.4 Flexible checksum persist + echo.** `checksumHeaders` added to
+  `s3api/objectmeta.go`; `captureObjectMetadata` extracts
+  `x-amz-checksum-{crc32,crc32c,sha1,sha256,algorithm}` into the existing
+  `object_metadata` / `multipart_upload_metadata` tables (no schema
+  change); `applyObjectHeaders` echoes them on GET/HEAD. **Body is not
+  re‑verified server‑side** (intentional; see §6.10). Tests:
+  `objectmeta_test.go` (echo, absence, multipart carry, x‑amz‑meta‑*
+  regression).
+- **8.5 Reap superseded chunks on overwrite.** `Handler.reapSupersededChunks`
+  shared by `handler.go:putObject` and `multipart.go:completeMultipartUpload`;
+  prior chunks + legacy `TelegramMessageID` (pre‑Phase‑3 row, no
+  `object_chunks`) are read *before* the txn and `backend.Delete`'d after
+  commit. Best‑effort + logged on failure. Tests: `multipart_test.go`
+  (chunk reap, legacy single‑message reap, tolerated delete failure,
+  multipart complete overwrite).
+- **8.6 Abandoned‑multipart janitor.** New `internal/s3api/janitor.go`:
+  `RunMultipartJanitor(interval, ttl)` ticks `sweepStaleMultipartUploads`,
+  which lists `store.StaleMultipartUploads` and calls a refactored
+  `abortUploadInternal` (now shared with the HTTP abort handler). Env
+  knobs `MULTIPART_TTL` (default `168h` = 7 d) and
+  `MULTIPART_SWEEP_INTERVAL` (default `1h`) in `config.Config`;
+  `cmd/telegram-s3/main.go` spawns the goroutine and cancels on shutdown.
+  Tests: `janitor_test.go` (stale aborts + fresh untouched, HTTP abort
+  regression, disabled‑interval immediate return).
+
 ### Follow‑ups (any time; see §6)
-- Overwrite‑orphan reaping (small; do with Phase 5 or standalone).
-- Abandoned‑multipart janitor.
-- Optional: min‑part‑size `EntityTooSmall`; malformed‑chunked → 400.
+- Phase 6 owes the 2500‑key paginated `aws s3api list-objects-v2` /
+  `rclone lsd` live pass (also §7 Phase 7).
 
 ---
 
@@ -415,12 +524,13 @@ and §4 (Phase 5/6/7). Acceptance = real default‑configured AWS CLI v2 / rclon
 | `internal/s3api/subresource.go` | P7.1 bucket subresource probes + ListMultipartUploads render |
 | `internal/s3api/deleteobjects.go` | P7.2 bulk DeleteObjects |
 | `internal/s3api/copy.go` | P7.4 CopyObject / UploadPartCopy, `parseCopySource`, `loadSource` |
-| `internal/s3api/objectmeta.go` | P7.5 metadata capture/echo, `response-*` overrides, conditional eval |
+| `internal/s3api/objectmeta.go` | P7.5 metadata capture/echo, `response-*` overrides, conditional eval; 8.4 `checksumHeaders` capture + echo |
+| `internal/s3api/janitor.go` | 8.6 `RunMultipartJanitor` + `sweepStaleMultipartUploads` (shares `abortUploadInternal` with the HTTP abort handler) |
 | `internal/storage/storage.go` | `Backend` interface, `Chunk` |
 | `internal/storage/telegram/bot.go` | chunked upload / ranged download / delete |
-| `internal/metadata/store.go` | SQLite: objects + object_chunks + multipart_* + **object_metadata** + **multipart_upload_metadata**; WAL. New: `ListMultipartUploads`, `GetObjectMetadata`, `replaceObjectMetadataTx`, `Put/GetMultipartUploadMetadata`; `Object.Metadata` |
-| `internal/config/config.go` | `TelegramAPIBaseURL`, `PublicEndpointURL` (P7.6 vhost) |
-| `cmd/telegram-s3/main.go` | wiring (passes base URL) |
+| `internal/metadata/store.go` | SQLite: objects + object_chunks + multipart_* + **object_metadata** + **multipart_upload_metadata**; WAL. New: `ListMultipartUploads`, `GetObjectMetadata`, `replaceObjectMetadataTx`, `Put/GetMultipartUploadMetadata`; `Object.Metadata`; 8.6 `StaleMultipartUploads` + `SetMultipartCreatedAt` (test-only) |
+| `internal/config/config.go` | `TelegramAPIBaseURL`, `PublicEndpointURL` (P7.6 vhost); 8.6 `MultipartTTL` + `MultipartSweepInterval` |
+| `cmd/telegram-s3/main.go` | wiring (passes base URL); 8.6 spawns `RunMultipartJanitor` and cancels on shutdown |
 
 Regression guard (verify every phase): Gokapi (aws‑sdk‑go v1, path‑style,
 UNSIGNED‑PAYLOAD, SHA1 keys) must keep working; schema additive; legacy

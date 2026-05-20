@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"time"
 )
 
 type Config struct {
@@ -18,19 +19,26 @@ type Config struct {
 	TelegramAPIBaseURL string
 	TempDir            string
 	PublicEndpointURL  string
+	// MultipartTTL is how long an in-progress multipart upload may sit
+	// untouched before the janitor aborts it (P8.6). MultipartSweepInterval
+	// is how often the janitor runs; <= 0 disables the sweep entirely.
+	MultipartTTL           time.Duration
+	MultipartSweepInterval time.Duration
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		ListenAddr:         getenv("LISTEN_ADDR", ":9000"),
-		DatabasePath:       getenv("DATABASE_PATH", "telegram-s3.db"),
-		AccessKeyID:        os.Getenv("S3_ACCESS_KEY_ID"),
-		SecretAccessKey:    os.Getenv("S3_SECRET_ACCESS_KEY"),
-		TelegramBotToken:   os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramChatID:     os.Getenv("TELEGRAM_CHAT_ID"),
-		TelegramAPIBaseURL: getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
-		TempDir:            getenv("TEMP_DIR", os.TempDir()),
-		PublicEndpointURL:  os.Getenv("PUBLIC_ENDPOINT_URL"),
+		ListenAddr:             getenv("LISTEN_ADDR", ":9000"),
+		DatabasePath:           getenv("DATABASE_PATH", "telegram-s3.db"),
+		AccessKeyID:            os.Getenv("S3_ACCESS_KEY_ID"),
+		SecretAccessKey:        os.Getenv("S3_SECRET_ACCESS_KEY"),
+		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatID:         os.Getenv("TELEGRAM_CHAT_ID"),
+		TelegramAPIBaseURL:     getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
+		TempDir:                getenv("TEMP_DIR", os.TempDir()),
+		PublicEndpointURL:      os.Getenv("PUBLIC_ENDPOINT_URL"),
+		MultipartTTL:           getDuration("MULTIPART_TTL", 7*24*time.Hour),
+		MultipartSweepInterval: getDuration("MULTIPART_SWEEP_INTERVAL", time.Hour),
 	}
 
 	if cfg.AccessKeyID == "" {
@@ -52,6 +60,15 @@ func Load() (Config, error) {
 func getenv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return fallback
+}
+
+func getDuration(key string, fallback time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if d, err := time.ParseDuration(value); err == nil {
+			return d
+		}
 	}
 	return fallback
 }

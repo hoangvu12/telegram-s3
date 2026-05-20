@@ -102,8 +102,11 @@ func TestCopyObjectOverwriteReapsOld(t *testing.T) {
 }
 
 func TestUploadPartCopy(t *testing.T) {
-	r := newMPRig(t)
-	src := rangeData()[:20] // bytes 0..19
+	// minPartSize-enforcement (8.2) means a non-last part must be >= 5 MiB,
+	// so the source object is sized accordingly; chunk size is bumped to keep
+	// the fake backend's per-chunk locking out of the test runtime.
+	r := newMPRigWithChunkSize(t, 1<<24)
+	src := bytes.Repeat([]byte("x"), minPartSize+128) // 5 MiB + tail
 	putRangeObject(t, r, "src", src)
 
 	var init initiateMultipartUploadResult

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -106,12 +107,20 @@ type mpRig struct {
 
 func newMPRig(t *testing.T) *mpRig {
 	t.Helper()
+	return newMPRigWithChunkSize(t, 4) // default: tiny chunks so parts span many messages
+}
+
+// newMPRigWithChunkSize lets a test pick a larger backend chunk size so it
+// can use realistic part sizes (e.g., the 5 MiB minPartSize for 8.2) without
+// paying the fake backend's per-chunk locking cost.
+func newMPRigWithChunkSize(t *testing.T, chunkSize int) *mpRig {
+	t.Helper()
 	store, err := metadata.Open(filepath.Join(t.TempDir(), "mp.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	be := newFakeBackend(4) // tiny chunks: parts span multiple messages
+	be := newFakeBackend(chunkSize)
 	cfg := config.Config{AccessKeyID: testAK, SecretAccessKey: testSecret}
 	h := NewHandler(cfg, store, be, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return &mpRig{t: t, h: h, be: be}
@@ -134,7 +143,9 @@ func (r *mpRig) do(method, target string, body []byte) *httptest.ResponseRecorde
 }
 
 func TestMultipartUploadHappyPath(t *testing.T) {
-	r := newMPRig(t)
+	// Part 1 must be >= 5 MiB per AWS rules (8.2). Bump backend chunk size so
+	// the test runs in well under a second.
+	r := newMPRigWithChunkSize(t, 1<<24)
 
 	if rec := r.do(http.MethodPut, "/send", nil); rec.Code != http.StatusOK {
 		t.Fatalf("create bucket: %d %s", rec.Code, rec.Body)
@@ -151,8 +162,8 @@ func TestMultipartUploadHappyPath(t *testing.T) {
 	}
 	uid := init.UploadID
 
-	part1 := []byte("hello world, this is part one!!")  // 31 bytes
-	part2 := []byte("and here is the second part, end") // 32 bytes
+	part1 := bytes.Repeat([]byte("a"), minPartSize)     // 5 MiB exactly
+	part2 := []byte("and here is the second part, end") // 32 bytes (last part is exempt)
 
 	put := func(n int, data []byte) string {
 		rec := r.do(http.MethodPut, fmt.Sprintf("/send/big.bin?partNumber=%d&uploadId=%s", n, uid), data)
@@ -283,6 +294,236 @@ func TestMultipartErrorCases(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 8.2: AWS rejects multipart uploads whose non-last parts are smaller than
+// 5 MiB with EntityTooSmall. The last part is exempt; a single-part complete
+// is always the last by definition.
+func TestMultipartCompleteEntityTooSmall(t *testing.T) {
+	bigPart := bytes.Repeat([]byte("A"), minPartSize)      // 5 MiB exactly
+	bigPlus := bytes.Repeat([]byte("B"), minPartSize+1024) // > 5 MiB
+	tinyPart := []byte("tiny")                             // < 5 MiB
+
+	uploadPart := func(t *testing.T, r *mpRig, uid string, n int, data []byte) string {
+		t.Helper()
+		rec := r.do(http.MethodPut, fmt.Sprintf("/send/k?partNumber=%d&uploadId=%s", n, uid), data)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("upload part %d: %d %s", n, rec.Code, rec.Body)
+		}
+		return md5hex(data)
+	}
+	completeBody := func(parts ...[2]string) string { // (partNumber, hex-md5)
+		var b strings.Builder
+		b.WriteString("<CompleteMultipartUpload>")
+		for _, p := range parts {
+			fmt.Fprintf(&b, `<Part><PartNumber>%s</PartNumber><ETag>"%s"</ETag></Part>`, p[0], p[1])
+		}
+		b.WriteString("</CompleteMultipartUpload>")
+		return b.String()
+	}
+	startUpload := func(t *testing.T) (*mpRig, string) {
+		t.Helper()
+		// Use a backend chunk size near the real 18 MiB so a 5 MiB part is
+		// one backend chunk — otherwise the fake backend's per-chunk locking
+		// dominates the test runtime.
+		r := newMPRigWithChunkSize(t, 1<<24)
+		seedBucket(t, r)
+		var init initiateMultipartUploadResult
+		xml.Unmarshal(r.do(http.MethodPost, "/send/k?uploads", nil).Body.Bytes(), &init)
+		return r, init.UploadID
+	}
+
+	t.Run("two undersized parts, second is last → 400 on first", func(t *testing.T) {
+		r, uid := startUpload(t)
+		e1 := uploadPart(t, r, uid, 1, tinyPart)
+		e2 := uploadPart(t, r, uid, 2, tinyPart)
+		rec := r.do(http.MethodPost, "/send/k?uploadId="+uid,
+			[]byte(completeBody([2]string{"1", e1}, [2]string{"2", e2})))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 (body %s)", rec.Code, rec.Body)
+		}
+		var er errorResponse
+		if err := xml.Unmarshal(rec.Body.Bytes(), &er); err != nil || er.Code != "EntityTooSmall" {
+			t.Fatalf("error code = %q (%v), want EntityTooSmall", er.Code, err)
+		}
+		// Upload row stays so the client can issue a clean abort.
+		if rec := r.do(http.MethodGet, "/send/k?uploadId="+uid, nil); rec.Code != http.StatusOK {
+			t.Fatalf("listParts after EntityTooSmall: %d, want 200 (upload row missing)", rec.Code)
+		}
+	})
+
+	t.Run("single tiny part succeeds (last by definition)", func(t *testing.T) {
+		r, uid := startUpload(t)
+		e1 := uploadPart(t, r, uid, 1, tinyPart)
+		rec := r.do(http.MethodPost, "/send/k?uploadId="+uid,
+			[]byte(completeBody([2]string{"1", e1})))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("single-part complete: %d %s", rec.Code, rec.Body)
+		}
+	})
+
+	t.Run("middle part undersized → 400", func(t *testing.T) {
+		r, uid := startUpload(t)
+		e1 := uploadPart(t, r, uid, 1, bigPart)
+		e2 := uploadPart(t, r, uid, 2, tinyPart)
+		e3 := uploadPart(t, r, uid, 3, bigPlus)
+		rec := r.do(http.MethodPost, "/send/k?uploadId="+uid,
+			[]byte(completeBody([2]string{"1", e1}, [2]string{"2", e2}, [2]string{"3", e3})))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 (body %s)", rec.Code, rec.Body)
+		}
+	})
+
+	t.Run("only last part undersized → 200", func(t *testing.T) {
+		r, uid := startUpload(t)
+		e1 := uploadPart(t, r, uid, 1, bigPart)
+		e2 := uploadPart(t, r, uid, 2, bigPlus)
+		e3 := uploadPart(t, r, uid, 3, tinyPart)
+		rec := r.do(http.MethodPost, "/send/k?uploadId="+uid,
+			[]byte(completeBody([2]string{"1", e1}, [2]string{"2", e2}, [2]string{"3", e3})))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (body %s)", rec.Code, rec.Body)
+		}
+	})
+}
+
+// 8.5: PutObject overwriting an existing key must reap the prior version's
+// Telegram messages. Otherwise long-running buckets grow unbounded chunks.
+func TestPutObjectOverwriteReapsChunks(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	// First PUT: 10 bytes -> 3 chunks (size 4, 4, 2) -> message IDs 1001..1003.
+	if rec := r.do(http.MethodPut, "/send/k", []byte("abcdefghij")); rec.Code != http.StatusOK {
+		t.Fatalf("put 1: %d %s", rec.Code, rec.Body)
+	}
+	r.be.mu.Lock()
+	firstMsgs := make([]int64, 0, len(r.be.files))
+	for fid := range r.be.files {
+		var n int64
+		fmt.Sscanf(fid, "f%d", &n)
+		firstMsgs = append(firstMsgs, 1000+n)
+	}
+	r.be.mu.Unlock()
+	if len(firstMsgs) == 0 {
+		t.Fatal("expected backend files after first PUT")
+	}
+
+	// Second PUT: different bytes -> different chunks. Old messages must go.
+	if rec := r.do(http.MethodPut, "/send/k", []byte("xy")); rec.Code != http.StatusOK {
+		t.Fatalf("put 2: %d %s", rec.Code, rec.Body)
+	}
+	r.be.mu.Lock()
+	defer r.be.mu.Unlock()
+	for _, mid := range firstMsgs {
+		if !r.be.deleted[mid] {
+			t.Fatalf("first PUT's message %d was not reaped after overwrite", mid)
+		}
+	}
+}
+
+// 8.5 (legacy): a pre-Phase-3 object has no object_chunks rows but a
+// non-zero TelegramMessageID. Reap that one message on overwrite too.
+func TestPutObjectOverwriteReapsLegacy(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	// Manually seed a legacy single-message row directly in the store.
+	legacyMID := int64(4242)
+	legacy := metadata.Object{
+		Bucket: "send", Key: "legacy", Size: 7, ETag: "deadbeef",
+		ContentType:    "application/octet-stream",
+		TelegramFileID: "f4242", TelegramMessageID: legacyMID,
+	}
+	if err := r.h.store.PutObject(context.Background(), legacy, nil); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	// PUT same key -> reap the legacy message.
+	if rec := r.do(http.MethodPut, "/send/legacy", []byte("new")); rec.Code != http.StatusOK {
+		t.Fatalf("put overwrite legacy: %d %s", rec.Code, rec.Body)
+	}
+	r.be.mu.Lock()
+	defer r.be.mu.Unlock()
+	if !r.be.deleted[legacyMID] {
+		t.Fatalf("legacy message %d not reaped on overwrite", legacyMID)
+	}
+}
+
+// 8.5: a failing backend.Delete on reap must NOT 5xx the (successful) PUT.
+func TestPutObjectOverwriteReapErrorTolerated(t *testing.T) {
+	r := newMPRig(t)
+	seedBucket(t, r)
+
+	// First PUT, record its message ids.
+	if rec := r.do(http.MethodPut, "/send/k", []byte("abcd")); rec.Code != http.StatusOK {
+		t.Fatalf("put 1: %d %s", rec.Code, rec.Body)
+	}
+	// Wrap the backend so the first reap call fails. The PUT must still 200.
+	fb := r.be
+	r.h.backend = &failingDeleteBackend{Backend: fb, failNext: true}
+	if rec := r.do(http.MethodPut, "/send/k", []byte("xyz")); rec.Code != http.StatusOK {
+		t.Fatalf("put 2 with failing reap: %d %s, want 200", rec.Code, rec.Body)
+	}
+}
+
+// 8.5 (multipart): CompleteMultipartUpload overwriting an existing key reaps
+// the prior version's chunks (mirrors putObject).
+func TestCompleteMultipartOverwriteReapsChunks(t *testing.T) {
+	// Need realistic part sizes; bump chunk to keep the test fast.
+	r := newMPRigWithChunkSize(t, 1<<24)
+	seedBucket(t, r)
+
+	// First write via plain PUT -> messageID 1001 (single backend chunk).
+	if rec := r.do(http.MethodPut, "/send/big.bin", []byte("first version")); rec.Code != http.StatusOK {
+		t.Fatalf("put 1: %d %s", rec.Code, rec.Body)
+	}
+	r.be.mu.Lock()
+	firstMsgs := make([]int64, 0, len(r.be.files))
+	for fid := range r.be.files {
+		var n int64
+		fmt.Sscanf(fid, "f%d", &n)
+		firstMsgs = append(firstMsgs, 1000+n)
+	}
+	r.be.mu.Unlock()
+	if len(firstMsgs) == 0 {
+		t.Fatal("expected backend files after first PUT")
+	}
+
+	// Overwrite via single-part MPU.
+	var init initiateMultipartUploadResult
+	xml.Unmarshal(r.do(http.MethodPost, "/send/big.bin?uploads", nil).Body.Bytes(), &init)
+	uid := init.UploadID
+	part := []byte("second version (single tiny part — last is exempt from 5 MiB rule)")
+	pr := r.do(http.MethodPut, fmt.Sprintf("/send/big.bin?partNumber=1&uploadId=%s", uid), part)
+	if pr.Code != http.StatusOK {
+		t.Fatalf("upload part: %d %s", pr.Code, pr.Body)
+	}
+	body := fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, pr.Header().Get("ETag"))
+	if rec := r.do(http.MethodPost, "/send/big.bin?uploadId="+uid, []byte(body)); rec.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", rec.Code, rec.Body)
+	}
+	r.be.mu.Lock()
+	defer r.be.mu.Unlock()
+	for _, mid := range firstMsgs {
+		if !r.be.deleted[mid] {
+			t.Fatalf("multipart complete did not reap prior message %d", mid)
+		}
+	}
+}
+
+// failingDeleteBackend wraps a backend and fails the first Delete call so
+// 8.5's "best-effort reap" branch can be exercised end-to-end.
+type failingDeleteBackend struct {
+	storage.Backend
+	failNext bool
+}
+
+func (f *failingDeleteBackend) Delete(ctx context.Context, mid int64) error {
+	if f.failNext {
+		f.failNext = false
+		return fmt.Errorf("simulated telegram delete failure for %d", mid)
+	}
+	return f.Backend.Delete(ctx, mid)
 }
 
 func md5hex(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }
