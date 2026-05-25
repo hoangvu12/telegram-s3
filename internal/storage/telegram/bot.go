@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,16 +35,46 @@ type BotStorage struct {
 }
 
 func NewBotStorage(token, chatID, baseURL string, logger *slog.Logger) *BotStorage {
+	return NewBotStorageWithOptions(token, chatID, baseURL, 0, logger)
+}
+
+// NewBotStorageWithOptions lets callers tune the keepalive pool size used for
+// concurrent chunk requests. Go's default MaxIdleConnsPerHost is 2, which
+// silently throttles fan-out: every extra chunk pays a TLS handshake. A pool
+// of 32 is enough for Phase 2's prefetch reader without being unbounded.
+// idlePerHost <= 0 falls back to a built-in default.
+func NewBotStorageWithOptions(token, chatID, baseURL string, idlePerHost int, logger *slog.Logger) *BotStorage {
 	if baseURL == "" {
 		baseURL = "https://api.telegram.org"
+	}
+	if idlePerHost <= 0 {
+		idlePerHost = 32
+	}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          idlePerHost * 4,
+		MaxIdleConnsPerHost:   idlePerHost,
+		MaxConnsPerHost:       idlePerHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	return &BotStorage{
 		token:     token,
 		chatID:    chatID,
 		baseURL:   strings.TrimRight(baseURL, "/"),
 		chunkSize: MaxChunkSize,
-		client:    &http.Client{Timeout: 0},
-		logger:    logger,
+		// No client-wide Timeout: a chunk transfer can legitimately take
+		// minutes for large objects. Per-request cancellation flows through
+		// the request context (handler ctx → http.NewRequestWithContext).
+		client: &http.Client{Transport: transport, Timeout: 0},
+		logger: logger,
 	}
 }
 

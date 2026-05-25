@@ -24,14 +24,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := metadata.Open(cfg.DatabasePath)
+	store, err := metadata.OpenWithOptions(cfg.DatabasePath, cfg.SQLiteReaderConns)
 	if err != nil {
 		logger.Error("open database", "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	backend := telegram.NewBotStorage(cfg.TelegramBotToken, cfg.TelegramChatID, cfg.TelegramAPIBaseURL, logger)
+	backend := telegram.NewBotStorageWithOptions(cfg.TelegramBotToken, cfg.TelegramChatID, cfg.TelegramAPIBaseURL, cfg.HTTPMaxIdleConnsPerHost, logger)
 	handler := s3api.NewHandler(cfg, store, backend, logger)
 
 	// Abandoned-multipart janitor (P8.6). Skipped if the sweep is disabled

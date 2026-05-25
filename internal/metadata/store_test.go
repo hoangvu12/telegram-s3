@@ -19,7 +19,7 @@ func TestStoreChunksRoundTrip(t *testing.T) {
 
 	// §6.4: WAL must be active.
 	var mode string
-	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
+	if err := s.read.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
 		t.Fatalf("pragma: %v", err)
 	}
 	if strings.ToLower(mode) != "wal" {
@@ -79,7 +79,7 @@ func TestStoreChunksRoundTrip(t *testing.T) {
 
 	// Legacy single-message object (pre-Phase-3): no chunk rows.
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO objects(bucket,key,size,etag,content_type,telegram_file_id,telegram_message_id,created_at,updated_at,deleted_at) VALUES('send','legacy.bin',12,'le','application/octet-stream','legacyfid',77,?,?,NULL)`, ts, ts); err != nil {
+	if _, err := s.write.ExecContext(ctx, `INSERT INTO objects(bucket,key,size,etag,content_type,telegram_file_id,telegram_message_id,created_at,updated_at,deleted_at) VALUES('send','legacy.bin',12,'le','application/octet-stream','legacyfid',77,?,?,NULL)`, ts, ts); err != nil {
 		t.Fatalf("insert legacy: %v", err)
 	}
 	lo, err := s.GetObject(ctx, "send", "legacy.bin")

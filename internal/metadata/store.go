@@ -12,8 +12,18 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+// Store holds two *sql.DB handles to the same WAL-mode SQLite file. modernc.org/sqlite
+// guidance (and the SQLite WAL model in general): a single pool with N connections
+// does NOT give parallel writes — SQLite serializes the writer regardless — and tends
+// to add SQLITE_BUSY contention. The right pattern is one writer connection plus a
+// pool of reader connections, since WAL allows many concurrent readers and one writer
+// to coexist freely.
+//
+// write is the sole writer (MaxOpenConns=1, BeginTx + Exec target it).
+// read is the reader pool (MaxOpenConns=N, QueryContext/QueryRowContext target it).
 type Store struct {
-	db *sql.DB
+	write *sql.DB
+	read  *sql.DB
 }
 
 type Bucket struct {
@@ -48,30 +58,59 @@ type Chunk struct {
 	Offset    int64
 }
 
+// Open opens the metadata store with the default reader-pool size (8). Use
+// OpenWithOptions when callers want to override via config.
 func Open(path string) (*Store, error) {
+	return OpenWithOptions(path, 8)
+}
+
+// OpenWithOptions opens the metadata store with an explicit reader-pool size.
+// readerConns <= 0 falls back to 8. The writer pool is always 1 (SQLite's
+// single-writer model). Both handles share the same WAL file and busy_timeout.
+func OpenWithOptions(path string, readerConns int) (*Store, error) {
+	if readerConns <= 0 {
+		readerConns = 8
+	}
 	// WAL + a busy timeout make the single-file DB resilient to the extra
 	// write pressure from chunk maps / multipart (S3-COMPAT-PLAN.md §6.4).
 	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
-	db, err := sql.Open("sqlite", dsn)
+
+	write, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	write.SetMaxOpenConns(1)
 
-	store := &Store{db: db}
+	read, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		write.Close()
+		return nil, err
+	}
+	read.SetMaxOpenConns(readerConns)
+	read.SetMaxIdleConns(readerConns)
+
+	store := &Store{write: write, read: read}
 	if err := store.migrate(); err != nil {
-		db.Close()
+		write.Close()
+		read.Close()
 		return nil, err
 	}
 	return store, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	rerr := s.read.Close()
+	werr := s.write.Close()
+	if werr != nil {
+		return werr
+	}
+	return rerr
+}
 
 func (s *Store) migrate() error {
 	// Additive only: the existing buckets/objects schema is untouched so live
 	// production rows (legacy single-message objects) keep working.
-	_, err := s.db.Exec(`
+	_, err := s.write.Exec(`
 CREATE TABLE IF NOT EXISTS buckets (
   name TEXT PRIMARY KEY,
   created_at TEXT NOT NULL
@@ -152,12 +191,12 @@ CREATE TABLE IF NOT EXISTS multipart_upload_metadata (
 }
 
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO buckets(name, created_at) VALUES(?, ?)`, name, time.Now().UTC().Format(time.RFC3339Nano))
+	_, err := s.write.ExecContext(ctx, `INSERT INTO buckets(name, created_at) VALUES(?, ?)`, name, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) DeleteBucket(ctx context.Context, name string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM buckets WHERE name = ?`, name)
+	result, err := s.write.ExecContext(ctx, `DELETE FROM buckets WHERE name = ?`, name)
 	if err != nil {
 		return err
 	}
@@ -170,7 +209,7 @@ func (s *Store) DeleteBucket(ctx context.Context, name string) error {
 
 func (s *Store) BucketExists(ctx context.Context, name string) (bool, error) {
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM buckets WHERE name = ?`, name).Scan(&exists)
+	err := s.read.QueryRowContext(ctx, `SELECT 1 FROM buckets WHERE name = ?`, name).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -178,7 +217,7 @@ func (s *Store) BucketExists(ctx context.Context, name string) (bool, error) {
 }
 
 func (s *Store) ListBuckets(ctx context.Context) ([]Bucket, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, created_at FROM buckets ORDER BY name`)
+	rows, err := s.read.QueryContext(ctx, `SELECT name, created_at FROM buckets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +246,7 @@ func (s *Store) PutObject(ctx context.Context, obj Object, chunks []Chunk) error
 	}
 	obj.UpdatedAt = now
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -264,7 +303,7 @@ func replaceObjectMetadataTx(ctx context.Context, tx *sql.Tx, bucket, key string
 // GetObjectMetadata returns the object's side-table metadata (empty for legacy
 // rows / objects stored without any).
 func (s *Store) GetObjectMetadata(ctx context.Context, bucket, key string) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, value FROM object_metadata WHERE bucket = ? AND key = ?`, bucket, key)
+	rows, err := s.read.QueryContext(ctx, `SELECT name, value FROM object_metadata WHERE bucket = ? AND key = ?`, bucket, key)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +322,7 @@ func (s *Store) GetObjectMetadata(ctx context.Context, bucket, key string) (map[
 func (s *Store) GetObject(ctx context.Context, bucket, key string) (Object, error) {
 	var obj Object
 	var created, updated string
-	err := s.db.QueryRowContext(ctx, `
+	err := s.read.QueryRowContext(ctx, `
 SELECT bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at
 FROM objects
 WHERE bucket = ? AND key = ? AND deleted_at IS NULL
@@ -302,7 +341,7 @@ WHERE bucket = ? AND key = ? AND deleted_at IS NULL
 // GetObjectChunks returns the ordered chunk map, or an empty slice for legacy
 // single-message objects (which predate Phase 3 and use Object.TelegramFileID).
 func (s *Store) GetObjectChunks(ctx context.Context, bucket, key string) ([]Chunk, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.read.QueryContext(ctx, `
 SELECT part_seq, telegram_file_id, telegram_message_id, size, offset
 FROM object_chunks
 WHERE bucket = ? AND key = ?
@@ -328,7 +367,7 @@ ORDER BY part_seq
 // removal is the caller's responsibility (done before this, while the chunk
 // list is still readable).
 func (s *Store) DeleteObject(ctx context.Context, bucket, key string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -395,7 +434,7 @@ FROM objects WHERE bucket = ? AND deleted_at IS NULL`
 	}
 	query += ` ORDER BY key`
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.read.QueryContext(ctx, query, args...)
 	if err != nil {
 		return ListPage{}, err
 	}
@@ -479,7 +518,7 @@ type MultipartPart struct {
 }
 
 func (s *Store) CreateMultipartUpload(ctx context.Context, uploadID, bucket, key, contentType string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO multipart_uploads(upload_id, bucket, key, content_type, created_at) VALUES(?, ?, ?, ?, ?)`,
+	_, err := s.write.ExecContext(ctx, `INSERT INTO multipart_uploads(upload_id, bucket, key, content_type, created_at) VALUES(?, ?, ?, ?, ?)`,
 		uploadID, bucket, key, contentType, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
@@ -487,7 +526,7 @@ func (s *Store) CreateMultipartUpload(ctx context.Context, uploadID, bucket, key
 func (s *Store) GetMultipartUpload(ctx context.Context, uploadID string) (MultipartUpload, error) {
 	var u MultipartUpload
 	var created string
-	err := s.db.QueryRowContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE upload_id = ?`, uploadID).
+	err := s.read.QueryRowContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE upload_id = ?`, uploadID).
 		Scan(&u.UploadID, &u.Bucket, &u.Key, &u.ContentType, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MultipartUpload{}, ErrNotFound
@@ -504,7 +543,7 @@ func (s *Store) GetMultipartUpload(ctx context.Context, uploadID string) (Multip
 // gateway does not paginate this — abandoned uploads are bounded in practice
 // and there is no lifecycle janitor yet (see progress §6.2).
 func (s *Store) ListMultipartUploads(ctx context.Context, bucket string) ([]MultipartUpload, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE bucket = ? ORDER BY key, upload_id`, bucket)
+	rows, err := s.read.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE bucket = ? ORDER BY key, upload_id`, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +566,7 @@ func (s *Store) ListMultipartUploads(ctx context.Context, bucket string) ([]Mult
 // only so the P8.6 janitor tests can stage a "stale" upload without sleeping
 // for the real TTL.
 func (s *Store) SetMultipartCreatedAt(ctx context.Context, uploadID string, t time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE multipart_uploads SET created_at = ? WHERE upload_id = ?`, t.UTC().Format(time.RFC3339Nano), uploadID)
+	_, err := s.write.ExecContext(ctx, `UPDATE multipart_uploads SET created_at = ? WHERE upload_id = ?`, t.UTC().Format(time.RFC3339Nano), uploadID)
 	return err
 }
 
@@ -535,7 +574,7 @@ func (s *Store) SetMultipartCreatedAt(ctx context.Context, uploadID string, t ti
 // strictly before the cutoff. Used by the P8.6 janitor; uploads within the
 // TTL window are left alone (they may be live in-progress writes).
 func (s *Store) StaleMultipartUploads(ctx context.Context, before time.Time) ([]MultipartUpload, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE created_at < ? ORDER BY created_at`, before.UTC().Format(time.RFC3339Nano))
+	rows, err := s.read.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE created_at < ? ORDER BY created_at`, before.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +593,7 @@ func (s *Store) StaleMultipartUploads(ctx context.Context, before time.Time) ([]
 }
 
 func (s *Store) GetMultipartPartChunks(ctx context.Context, uploadID string, partNumber int) ([]Chunk, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq, telegram_file_id, telegram_message_id, size FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
+	rows, err := s.read.QueryContext(ctx, `SELECT seq, telegram_file_id, telegram_message_id, size FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -574,7 +613,7 @@ func (s *Store) GetMultipartPartChunks(ctx context.Context, uploadID string, par
 // the same part number is allowed by S3; the caller reaps the old chunks'
 // Telegram messages, having read them first).
 func (s *Store) PutMultipartPart(ctx context.Context, uploadID string, partNumber int, etag string, size int64, chunks []Chunk) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -597,7 +636,7 @@ ON CONFLICT(upload_id, part_number) DO UPDATE SET etag = excluded.etag, size = e
 }
 
 func (s *Store) ListMultipartParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT part_number, etag, size FROM multipart_parts WHERE upload_id = ? ORDER BY part_number`, uploadID)
+	rows, err := s.read.QueryContext(ctx, `SELECT part_number, etag, size FROM multipart_parts WHERE upload_id = ? ORDER BY part_number`, uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +654,7 @@ func (s *Store) ListMultipartParts(ctx context.Context, uploadID string) ([]Mult
 
 // AllMultipartChunks returns every chunk across all parts (for abort cleanup).
 func (s *Store) AllMultipartChunks(ctx context.Context, uploadID string) ([]Chunk, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT telegram_file_id, telegram_message_id FROM multipart_part_chunks WHERE upload_id = ? ORDER BY part_number, seq`, uploadID)
+	rows, err := s.read.QueryContext(ctx, `SELECT telegram_file_id, telegram_message_id FROM multipart_part_chunks WHERE upload_id = ? ORDER BY part_number, seq`, uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -640,7 +679,7 @@ func (s *Store) FinalizeMultipartUpload(ctx context.Context, obj Object, chunks 
 	}
 	obj.UpdatedAt = now
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -679,7 +718,7 @@ ON CONFLICT(bucket, key) DO UPDATE SET
 // completed object (the complete request does not resend them).
 func (s *Store) PutMultipartUploadMetadata(ctx context.Context, uploadID string, kv map[string]string) error {
 	for name, value := range kv {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO multipart_upload_metadata(upload_id, name, value) VALUES(?, ?, ?)`, uploadID, name, value); err != nil {
+		if _, err := s.write.ExecContext(ctx, `INSERT INTO multipart_upload_metadata(upload_id, name, value) VALUES(?, ?, ?)`, uploadID, name, value); err != nil {
 			return err
 		}
 	}
@@ -687,7 +726,7 @@ func (s *Store) PutMultipartUploadMetadata(ctx context.Context, uploadID string,
 }
 
 func (s *Store) GetMultipartUploadMetadata(ctx context.Context, uploadID string) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, value FROM multipart_upload_metadata WHERE upload_id = ?`, uploadID)
+	rows, err := s.read.QueryContext(ctx, `SELECT name, value FROM multipart_upload_metadata WHERE upload_id = ?`, uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -706,7 +745,7 @@ func (s *Store) GetMultipartUploadMetadata(ctx context.Context, uploadID string)
 // DeleteMultipartUpload removes all bookkeeping for an upload (abort path,
 // after the caller has reaped the Telegram messages).
 func (s *Store) DeleteMultipartUpload(ctx context.Context, uploadID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
