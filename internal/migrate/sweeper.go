@@ -321,15 +321,25 @@ func (s *Sweeper) pass2Reap(ctx context.Context, limit int) {
 }
 
 // reapOne deletes the legacy bot-API-uploaded message via MTProto and
-// drops the pending_delete row. Using MTProto here (not the Bot HTTP
-// API) is load-bearing: Telegram's Bot API enforces a 48-hour delete
-// limit ("Bad Request: message can't be deleted" for older messages),
-// and the chunks pass-1 migrates are typically weeks/months old. The
-// same bot is a channel admin via MTProto — channels.deleteMessages
-// imposes no age limit on admin deletes. The TransportMTProto tag
-// here means "use the MTProto delete path"; the underlying message
-// ID was assigned when Bot API uploaded the chunk, but message IDs
-// are channel-scoped, not transport-scoped, so MTProto can target it.
+// drops the pending_delete row. The TransportMTProto tag means "use
+// the MTProto delete path"; the underlying message ID was assigned
+// when Bot API uploaded the chunk, but message IDs are channel-scoped
+// (not transport-scoped) so MTProto can target it.
+//
+// Operational note (2026-05-26 production incident): Telegram refuses
+// to delete sufficiently-old bot-authored messages over MTProto with
+// MESSAGE_DELETE_FORBIDDEN, even when the bot has the can_delete_messages
+// admin right server-side (verified via channels.getParticipant). The
+// Bot HTTP API has the same constraint and surfaces it as
+// "Bad Request: message can't be deleted" past 48h. Telegram exposes
+// no admin override that bypasses this for bot identities. Production
+// runs with BOT_DELETE_GRACE=999h to make pass-2 effectively dormant
+// — legacy bot messages linger in the channel as inaccessible-by-S3
+// zombies, which is harmless (chunk map points to the new mtproto
+// transport, reads work). reapOne stays MTProto-routed so when grace
+// is small enough that this CAN succeed (e.g., during fresh deploys
+// where pass-1 just swapped) the path works without code change.
+//
 // Idempotent: a message that's already gone returns 0 affected and
 // no error.
 func (s *Sweeper) reapOne(ctx context.Context, msgID int64, botIndex int) error {
