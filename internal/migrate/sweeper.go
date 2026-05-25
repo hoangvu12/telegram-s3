@@ -105,6 +105,12 @@ func NewSweeper(opts Options) (*Sweeper, error) {
 // reaps pending_delete rows older than the grace window. Errors
 // inside a pass are logged and don't abort the loop — a single bad
 // chunk shouldn't stop the migration.
+//
+// A drain snapshot is logged at startup and once per tick so an
+// operator can read remaining-bot-chunks / pending-deletes / latest-
+// swap progress directly from `journalctl` (or Easypanel's log
+// tail) without needing container-shell access to the DB. The
+// startup line in particular makes every restart a free measurement.
 func (s *Sweeper) Run(ctx context.Context) {
 	if s == nil {
 		return
@@ -113,6 +119,7 @@ func (s *Sweeper) Run(ctx context.Context) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	s.logger.Info("migration sweeper started", "rate_per_day", s.rate, "grace", s.grace, "tick_interval", interval)
+	s.logDrainSnapshot(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -120,8 +127,34 @@ func (s *Sweeper) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			s.runOnce(ctx)
+			s.logDrainSnapshot(ctx)
 		}
 	}
+}
+
+// logDrainSnapshot fetches a BotMigrationSnapshot and emits it at INFO.
+// Errors are logged at WARN and don't propagate — a transient SQLite
+// read failure shouldn't taint the sweeper's tick. The "since_latest_swap"
+// field is derived here rather than in the store so the value reflects
+// the same clock the rest of the sweeper uses (s.now); test code that
+// freezes the clock sees consistent timestamps.
+func (s *Sweeper) logDrainSnapshot(ctx context.Context) {
+	snap, err := s.store.BotMigrationSnapshot(ctx)
+	if err != nil {
+		s.logger.Warn("drain snapshot failed", "error", err)
+		return
+	}
+	if snap.LatestSwap.IsZero() {
+		s.logger.Info("drain snapshot",
+			"bot_chunks_remaining", snap.BotChunksRemaining,
+			"pending_deletes", snap.PendingDeletes)
+		return
+	}
+	s.logger.Info("drain snapshot",
+		"bot_chunks_remaining", snap.BotChunksRemaining,
+		"pending_deletes", snap.PendingDeletes,
+		"latest_swap", snap.LatestSwap.UTC().Format(time.RFC3339),
+		"since_latest_swap", s.now().UTC().Sub(snap.LatestSwap.UTC()).Round(time.Second))
 }
 
 // tickInterval is 1 hour by default — that converts `rate` into an

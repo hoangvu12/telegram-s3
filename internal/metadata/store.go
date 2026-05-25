@@ -1096,6 +1096,64 @@ func (s *Store) CountBotChunks(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// BotMigrationSnapshot is a point-in-time picture of the Phase 4
+// sweeper's remaining work. The sweeper logs this at startup and once
+// per tick so operators can read drain progress directly from the
+// service logs — important because the production deploy's SQLite DB
+// lives inside an Easypanel container that the easypanel-skill tRPC
+// API can't reach (terminal is a separate WebSocket).
+type BotMigrationSnapshot struct {
+	// BotChunksRemaining is the count of object_chunks rows still
+	// addressed via the Bot HTTP API. Drops by ~MigrationRate/day.
+	// Item-5-ready when this hits 0.
+	BotChunksRemaining int64
+	// PendingDeletes is the size of the bot_chunks_pending_delete
+	// queue — pass-1 enqueues here, pass-2 reaps after the grace
+	// window. Hovers near MigrationRate × grace / 24h in steady state.
+	PendingDeletes int64
+	// LatestSwap is the newest swapped_at across pending_delete rows.
+	// The IsZero check on the value tells the caller whether the
+	// table was empty (no swaps yet) vs. had data — we don't surface
+	// sql.NullTime to keep the struct boring to log.
+	LatestSwap time.Time
+}
+
+// BotMigrationSnapshot reads the three drain-progress counts in a
+// single read-pool round trip (one COUNT on object_chunks, one
+// combined COUNT + MAX on bot_chunks_pending_delete). Safe to call on
+// every sweeper tick — at the default MigrationRate=100/day this
+// fires ~96 times/day, well under any meaningful SQLite contention.
+func (s *Store) BotMigrationSnapshot(ctx context.Context) (BotMigrationSnapshot, error) {
+	var snap BotMigrationSnapshot
+	if err := s.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM object_chunks WHERE transport = 'bot'`,
+	).Scan(&snap.BotChunksRemaining); err != nil {
+		return snap, fmt.Errorf("count bot chunks: %w", err)
+	}
+	// MAX(swapped_at) is NULL on an empty table; sql.NullString catches
+	// that. The column is stored as an RFC3339Nano string (see
+	// SwapBotChunkToMtproto), so we Scan into a string and parse — the
+	// driver doesn't auto-convert text to time.Time. Same pattern as
+	// PendingDeletesOlderThan. Combining COUNT + MAX in one row keeps
+	// the snapshot to two read-pool round trips total.
+	var latest sql.NullString
+	if err := s.read.QueryRowContext(ctx,
+		`SELECT COUNT(*), MAX(swapped_at) FROM bot_chunks_pending_delete`,
+	).Scan(&snap.PendingDeletes, &latest); err != nil {
+		return snap, fmt.Errorf("count pending deletes: %w", err)
+	}
+	if latest.Valid {
+		// Parse failures leave LatestSwap zero — that's the same fallback
+		// the logger uses for "no rows yet", so an unparseable timestamp
+		// degrades to "we have rows but no readable max" rather than a
+		// confusing year-0 line in the log. Production rows are always
+		// written via SwapBotChunkToMtproto's RFC3339Nano formatter, so
+		// the parse should not fail.
+		snap.LatestSwap, _ = time.Parse(time.RFC3339Nano, latest.String)
+	}
+	return snap, nil
+}
+
 func deleteMultipartTx(ctx context.Context, tx *sql.Tx, uploadID string) error {
 	for _, q := range []string{
 		`DELETE FROM multipart_part_chunks WHERE upload_id = ?`,

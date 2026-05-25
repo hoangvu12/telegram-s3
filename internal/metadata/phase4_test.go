@@ -166,6 +166,85 @@ func TestListBotChunksOldestFirst(t *testing.T) {
 	}
 }
 
+// TestBotMigrationSnapshot pins the three drain numbers the sweeper
+// will log every tick. Empty-state ergonomics matter as much as the
+// populated case — LatestSwap.IsZero() is what tells the log path to
+// drop the timestamp fields so an operator parsing logs doesn't see a
+// spurious "0001-01-01T00:00:00Z" before any drain has happened.
+func TestBotMigrationSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "snap.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	// Empty DB → all zeros, LatestSwap is zero-valued.
+	snap, err := s.BotMigrationSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot empty: %v", err)
+	}
+	if snap.BotChunksRemaining != 0 || snap.PendingDeletes != 0 || !snap.LatestSwap.IsZero() {
+		t.Fatalf("empty snapshot = %+v; want zeros with IsZero LatestSwap", snap)
+	}
+
+	if err := s.CreateBucket(ctx, "b"); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+	// Two bot-transport chunks, no swaps yet.
+	for i, key := range []string{"a", "b"} {
+		if err := s.PutObject(ctx, Object{Bucket: "b", Key: key, Size: 1, ETag: "e", ContentType: "x"},
+			[]Chunk{{Seq: 0, FileID: "f", MessageID: int64(100 + i), Size: 1, Offset: 0, Transport: "bot", BotIndex: 0}}); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	snap, err = s.BotMigrationSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot pre-swap: %v", err)
+	}
+	if snap.BotChunksRemaining != 2 || snap.PendingDeletes != 0 || !snap.LatestSwap.IsZero() {
+		t.Fatalf("pre-swap snapshot = %+v; want 2 bot chunks, 0 pending, zero LatestSwap", snap)
+	}
+
+	// Swap one row — that drops bot count to 1 and pushes the pending row.
+	swapTime := time.Date(2026, 5, 25, 17, 30, 0, 0, time.UTC)
+	if err := s.SwapBotChunkToMtproto(ctx, "b", "a", 0, 100, 0, 999, 1, swapTime); err != nil {
+		t.Fatalf("swap: %v", err)
+	}
+	snap, err = s.BotMigrationSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot post-swap: %v", err)
+	}
+	if snap.BotChunksRemaining != 1 {
+		t.Errorf("BotChunksRemaining = %d; want 1", snap.BotChunksRemaining)
+	}
+	if snap.PendingDeletes != 1 {
+		t.Errorf("PendingDeletes = %d; want 1", snap.PendingDeletes)
+	}
+	if !snap.LatestSwap.Equal(swapTime) {
+		t.Errorf("LatestSwap = %v; want %v", snap.LatestSwap, swapTime)
+	}
+
+	// A second swap with a later timestamp must surface as LatestSwap.
+	// This pins MAX semantics: the row count is 2 but only the newer
+	// timestamp matters for "is the sweeper alive" debugging.
+	laterSwap := swapTime.Add(time.Hour)
+	if err := s.SwapBotChunkToMtproto(ctx, "b", "b", 0, 101, 0, 1000, 1, laterSwap); err != nil {
+		t.Fatalf("swap 2: %v", err)
+	}
+	snap, err = s.BotMigrationSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot post-swap2: %v", err)
+	}
+	if snap.PendingDeletes != 2 {
+		t.Errorf("PendingDeletes = %d; want 2", snap.PendingDeletes)
+	}
+	if !snap.LatestSwap.Equal(laterSwap) {
+		t.Errorf("LatestSwap = %v; want %v (MAX of two swaps)", snap.LatestSwap, laterSwap)
+	}
+}
+
 func keysOf(cs []BotChunkLoc) []string {
 	out := make([]string, len(cs))
 	for i, c := range cs {
