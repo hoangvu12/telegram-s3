@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"telegram-s3/internal/metadata"
@@ -44,8 +45,13 @@ type Sweeper struct {
 	// pass2Budget caps the per-cycle pass-2 work — a backlog still
 	// drains over multiple ticks rather than spiking RPC count.
 	pass2Budget int
-	logger      *slog.Logger
-	now         func() time.Time // injectable clock for tests
+	// workers caps pass-1 concurrency within a tick. Each worker holds
+	// one in-flight (bot download + mtproto upload) pair; serialized
+	// pass-1 leaves the tick mostly idle when per-chunk latency
+	// dominates (typical: ~seconds per chunk).
+	workers int
+	logger  *slog.Logger
+	now     func() time.Time // injectable clock for tests
 }
 
 // Options is the Sweeper constructor input. MigrationRate / Grace
@@ -59,6 +65,7 @@ type Options struct {
 	MigrationRate  int           // rows/day; 0 disables pass-1
 	BotDeleteGrace time.Duration // pass-2 lag; 0 reaps inline (tests only)
 	Pass2Budget    int           // per-cycle reap cap; defaults to 4× pass-1 cap (catches backlog faster than pass-1 fills it)
+	Workers        int           // pass-1 concurrency cap; defaults to 4, clamped to [1, 32]
 	Logger         *slog.Logger
 	Now            func() time.Time // optional; defaults to time.Now
 }
@@ -80,6 +87,13 @@ func NewSweeper(opts Options) (*Sweeper, error) {
 	if pass2 <= 0 {
 		pass2 = max(4*opts.MigrationRate/24, 50) // catch backlogs faster than pass-1 fills
 	}
+	workers := opts.Workers
+	if workers <= 0 {
+		workers = 4
+	}
+	if workers > 32 {
+		workers = 32
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -95,6 +109,7 @@ func NewSweeper(opts Options) (*Sweeper, error) {
 		rate:        opts.MigrationRate,
 		grace:       opts.BotDeleteGrace,
 		pass2Budget: pass2,
+		workers:     workers,
 		logger:      logger,
 		now:         now,
 	}, nil
@@ -118,7 +133,7 @@ func (s *Sweeper) Run(ctx context.Context) {
 	interval := s.tickInterval()
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	s.logger.Info("migration sweeper started", "rate_per_day", s.rate, "grace", s.grace, "tick_interval", interval)
+	s.logger.Info("migration sweeper started", "rate_per_day", s.rate, "grace", s.grace, "tick_interval", interval, "workers", s.workers)
 	s.logDrainSnapshot(ctx)
 	for {
 		select {
@@ -202,6 +217,12 @@ func (s *Sweeper) perTickBudget() int {
 // through MTProto, and atomically swaps the row + enqueues the old
 // bot message for pass-2 reap. A single chunk failure is logged and
 // skipped — the next tick will pick it up again.
+//
+// Chunks fan out across s.workers goroutines: each migrateOne is
+// network-bound (bot HTTP download + MTProto upload, ~seconds wall
+// time) so serializing them strands tick budget. Per-chunk failures
+// don't propagate — one bad row mustn't abort sibling work in flight
+// or the unstarted tail of the list.
 func (s *Sweeper) pass1Migrate(ctx context.Context, limit int) {
 	if limit <= 0 {
 		return
@@ -214,15 +235,24 @@ func (s *Sweeper) pass1Migrate(ctx context.Context, limit int) {
 	if len(chunks) == 0 {
 		return
 	}
+	sem := make(chan struct{}, s.workers)
+	var wg sync.WaitGroup
 	for _, c := range chunks {
 		if ctx.Err() != nil {
-			return
+			break
 		}
-		if err := s.migrateOne(ctx, c); err != nil {
-			s.logger.Warn("migrate pass-1 chunk failed",
-				"bucket", c.Bucket, "key", c.Key, "seq", c.PartSeq, "error", err)
-		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(c metadata.BotChunkLoc) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := s.migrateOne(ctx, c); err != nil {
+				s.logger.Warn("migrate pass-1 chunk failed",
+					"bucket", c.Bucket, "key", c.Key, "seq", c.PartSeq, "error", err)
+			}
+		}(c)
 	}
+	wg.Wait()
 }
 
 // migrateOne is the per-chunk pass-1 sequence:

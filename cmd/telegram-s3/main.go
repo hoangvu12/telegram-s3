@@ -121,6 +121,7 @@ func main() {
 			MTProto:        mtStorage,
 			MigrationRate:  pickMigrationRate(cfg),
 			BotDeleteGrace: cfg.BotDeleteGrace,
+			Workers:        cfg.MigrationWorkers,
 			Logger:         logger,
 		})
 		if err != nil {

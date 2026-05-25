@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -61,6 +62,10 @@ type memBackend struct {
 	dels  []int64
 	// nextErr: if non-nil, the next call returns err and then clears.
 	nextErr error
+	// downloadHook: if non-nil, called at entry to DownloadRange before
+	// the data lookup. Used by concurrency tests to observe in-flight
+	// fan-out (e.g. by synchronizing on a barrier). Unused → no-op.
+	downloadHook func()
 }
 
 func newMemBackend(label string, ch *channel) *memBackend {
@@ -115,7 +120,11 @@ func (m *memBackend) DownloadRange(ctx context.Context, ref storage.ChunkRef, of
 	m.mu.Lock()
 	err := m.nextErr
 	m.nextErr = nil
+	hook := m.downloadHook
 	m.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -454,4 +463,79 @@ func TestSweeperInlineReap(t *testing.T) {
 		t.Fatalf("inline reap should have gone through MTProto; mt deletes=%+v", mt.deletedIDs())
 	}
 	atomic.LoadInt64(&bot.next) // silence unused import in some Go versions
+}
+
+// TestSweeperPass1RunsInParallel: pass-1 must fan out across
+// Options.Workers goroutines. Each migrateOne is network-bound
+// (bot download + mtproto upload, ~seconds wall time in prod), so a
+// regression to serial execution would silently re-cap real
+// throughput at ~1 chunk per (download + upload) round-trip instead
+// of workers× that.
+//
+// The test wires a barrier into the bot backend's DownloadRange: 4
+// goroutines must arrive concurrently before any can proceed. Serial
+// pass-1 → only one arrives → test deadlocks → t.Fatal via timeout.
+func TestSweeperPass1RunsInParallel(t *testing.T) {
+	store, err := metadata.Open(filepath.Join(t.TempDir(), "sw.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ch := newChannel()
+	bot := newMemBackend(storage.TransportBot, ch)
+	mt := newMemBackend(storage.TransportMTProto, ch)
+
+	const workers = 4
+	barrier := make(chan struct{}, workers)
+	released := make(chan struct{})
+	bot.downloadHook = func() {
+		barrier <- struct{}{}
+		<-released
+	}
+
+	sw, err := NewSweeper(Options{
+		Store: store, Bot: bot, MTProto: mt,
+		MigrationRate: 100, BotDeleteGrace: time.Hour, Pass2Budget: 100,
+		Workers: workers,
+		Logger:  slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("NewSweeper: %v", err)
+	}
+
+	for i := 0; i < workers; i++ {
+		seedBotChunk(t, store, bot, "b", "k"+strconv.Itoa(i), int64(100+i), []byte("payload"))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		sw.pass1Migrate(context.Background(), workers)
+		close(done)
+	}()
+
+	// All `workers` downloads must arrive on the barrier within a short
+	// window. Serial pass-1 produces exactly one arrival → timeout.
+	for i := 0; i < workers; i++ {
+		select {
+		case <-barrier:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("pass-1 did not fan out: only %d of %d downloads arrived concurrently", i, workers)
+		}
+	}
+	close(released)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pass-1 hung after barrier release")
+	}
+
+	// Sanity: all chunks migrated.
+	for i := 0; i < workers; i++ {
+		chunks, err := store.GetObjectChunks(context.Background(), "b", "k"+strconv.Itoa(i))
+		if err != nil || len(chunks) != 1 || chunks[0].Transport != storage.TransportMTProto {
+			t.Fatalf("chunk k%d not migrated: err=%v chunks=%+v", i, err, chunks)
+		}
+	}
 }

@@ -88,6 +88,13 @@ type Config struct {
 	// 0 disables the sweeper entirely (the dispatcher still routes new
 	// uploads via MTProto in dual mode, but no migration happens).
 	MigrationRate int
+	// MigrationWorkers caps pass-1 concurrency within a single tick. Each
+	// worker holds one in-flight (bot download + mtproto upload) pair, so
+	// e.g. 4 workers lets 4 chunks migrate at once instead of serialized.
+	// Default 4, clamped to [1, 32]. Tune up only if profiling says the
+	// MTProto session pool / bot HTTP API can absorb more parallelism
+	// without tripping FLOOD_WAIT.
+	MigrationWorkers int
 	// BotDeleteGrace is how long a migrated bot message lingers in
 	// bot_chunks_pending_delete before the sweeper's pass-2 reaps it.
 	// See PHASES.md design decision #14: this window prevents a reader
@@ -124,6 +131,7 @@ func Load() (Config, error) {
 		TelegramPoolSize:        getInt("TELEGRAM_POOL_SIZE", 4),
 		TelegramUploadThreads:   getInt("TELEGRAM_UPLOAD_THREADS", 8),
 		MigrationRate:           getIntNonNeg("MIGRATION_RATE", 100),
+		MigrationWorkers:        getInt("MIGRATION_WORKERS", 4),
 		BotDeleteGrace:          getDuration("BOT_DELETE_GRACE", time.Hour),
 	}
 

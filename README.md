@@ -110,14 +110,21 @@ aws --endpoint-url http://localhost:9000 s3 cp s3://test/some-file ./downloaded
 2. Watch `bot_chunks_remaining` (logged in `drain snapshot` lines).
    When it hits 0, flip env to `TELEGRAM_TRANSPORT=mtproto`.
 
-The sweeper rate is bounded by `MIGRATION_RATE` (rows/day). Realistic
-production numbers per single bot:
+The sweeper rate is bounded by `MIGRATION_RATE` (rows/day) × the
+parallel fan-out set by `MIGRATION_WORKERS` (default 4). Per-tick the
+sweeper picks `MIGRATION_RATE × 60 / 86400` rows and migrates them
+across that many goroutines. Realistic numbers per single bot at the
+default `MIGRATION_WORKERS=4`:
 
-| MIGRATION_RATE | Effective | Note |
-|---|---|---|
-| 1000 | ~1000/day | Conservative; very low Telegram load |
-| 10000 | ~8640/day | Hits the 60s tick-interval clamp; one bot's effective ceiling for migration throughput |
-| 20000+ | same as 10000 | Single-bot ceiling; for higher, add more tokens via `TELEGRAM_BOT_TOKENS=tok1,tok2,...` |
+| MIGRATION_RATE | Per-tick budget | Effective (4 workers) | Note |
+|---|---|---|---|
+| 1000 | 1 | ~1000/day | Conservative; barely uses fan-out |
+| 10000 | 6 | ~8640/day | Default ceiling — 60s tick clamp; budget = floor of `rate × 60 / 86400` |
+| 40000 | 27 | ~38000/day | Saturates 4 workers per tick (~6 chunks per worker per minute at ~10s wall time) |
+| 80000+ | 55+ | bot-API + MTProto FLOOD_WAIT | Past this you'll trip rate-limits; add a 2nd token via `TELEGRAM_BOT_TOKENS=tok1,tok2,...` instead |
+
+Lower `MIGRATION_WORKERS` to throttle without changing `MIGRATION_RATE`
+(e.g. while debugging FLOOD_WAIT). Clamped to `[1, 32]`.
 
 ## Configuration reference
 
@@ -131,7 +138,7 @@ The full env surface is documented inline in `.env.example`. Highlights:
   `CHUNK_TIMEOUT`, `LOCATION_CACHE_TTL`, `TELEGRAM_MAX_CHUNK_SIZE`,
   `TELEGRAM_POOL_SIZE`, `TELEGRAM_UPLOAD_THREADS` — all have safe
   defaults; tweak only if profiling says so.
-- **Migration:** `MIGRATION_RATE`, `BOT_DELETE_GRACE`.
+- **Migration:** `MIGRATION_RATE`, `MIGRATION_WORKERS`, `BOT_DELETE_GRACE`.
 
 ## Known limitations
 
