@@ -320,19 +320,25 @@ func (s *Sweeper) pass2Reap(ctx context.Context, limit int) {
 	}
 }
 
-// reapOne deletes the bot message and drops the pending_delete row.
-// We DO NOT short-circuit on delete error — Telegram's
-// deleteMessage is idempotent (a message that's already gone
-// returns OK), so the most common "error" here is a real bot
-// permission issue, which is worth surfacing AND retrying next
-// tick.
+// reapOne deletes the legacy bot-API-uploaded message via MTProto and
+// drops the pending_delete row. Using MTProto here (not the Bot HTTP
+// API) is load-bearing: Telegram's Bot API enforces a 48-hour delete
+// limit ("Bad Request: message can't be deleted" for older messages),
+// and the chunks pass-1 migrates are typically weeks/months old. The
+// same bot is a channel admin via MTProto — channels.deleteMessages
+// imposes no age limit on admin deletes. The TransportMTProto tag
+// here means "use the MTProto delete path"; the underlying message
+// ID was assigned when Bot API uploaded the chunk, but message IDs
+// are channel-scoped, not transport-scoped, so MTProto can target it.
+// Idempotent: a message that's already gone returns 0 affected and
+// no error.
 func (s *Sweeper) reapOne(ctx context.Context, msgID int64, botIndex int) error {
-	if err := s.bot.Delete(ctx, storage.ChunkRef{
-		Transport: storage.TransportBot,
+	if err := s.mt.Delete(ctx, storage.ChunkRef{
+		Transport: storage.TransportMTProto,
 		MessageID: msgID,
 		BotIndex:  botIndex,
 	}); err != nil {
-		return fmt.Errorf("bot delete: %w", err)
+		return fmt.Errorf("mtproto delete: %w", err)
 	}
 	if err := s.store.DeletePendingDelete(ctx, msgID, botIndex); err != nil {
 		return fmt.Errorf("drop pending row: %w", err)
