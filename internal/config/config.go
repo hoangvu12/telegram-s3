@@ -46,6 +46,18 @@ type Config struct {
 	// the public Bot API 20 MB getFile cap; users running a self-hosted
 	// `tdlib/telegram-bot-api` server can raise this to ~1.9 GiB. Phase 1.
 	TelegramMaxChunkSize int64
+	// StreamConcurrency / StreamBuffers / ChunkTimeout govern the
+	// parallel-prefetch reader on the object GET path (Phase 2).
+	// StreamConcurrency caps the number of in-flight chunk fetches per
+	// stream; StreamBuffers is the ordered delivery channel's capacity;
+	// ChunkTimeout bounds each individual fetch. StreamChunkSize is the
+	// reader's prefetch window in object-space bytes — independent of
+	// the upload chunk size (typically larger, so one fetch can span
+	// multiple Telegram messages).
+	StreamConcurrency int
+	StreamBuffers     int
+	ChunkTimeout      time.Duration
+	StreamChunkSize   int64
 }
 
 func Load() (Config, error) {
@@ -65,6 +77,10 @@ func Load() (Config, error) {
 		SQLiteReaderConns:       getInt("SQLITE_READER_CONNS", 8),
 		LocationCacheTTL:        getDuration("LOCATION_CACHE_TTL", 30*time.Minute),
 		TelegramMaxChunkSize:    getBytes("TELEGRAM_MAX_CHUNK_SIZE", 18<<20),
+		StreamConcurrency:       getInt("STREAM_CONCURRENCY", 4),
+		StreamBuffers:           getInt("STREAM_BUFFERS", 8),
+		ChunkTimeout:            getDuration("CHUNK_TIMEOUT", 30*time.Second),
+		StreamChunkSize:         getBytes("STREAM_CHUNK_SIZE", 4<<20),
 	}
 
 	if cfg.AccessKeyID == "" {

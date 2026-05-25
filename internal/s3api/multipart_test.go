@@ -53,7 +53,7 @@ func (f *fakeBackend) Upload(_ context.Context, _, _ string, body io.Reader) ([]
 		mid := 1000 + f.seq
 		f.files[fid] = piece
 		f.mu.Unlock()
-		chunks = append(chunks, storage.Chunk{Seq: seq, FileID: fid, MessageID: mid, Size: int64(len(piece)), Offset: int64(off)})
+		chunks = append(chunks, storage.Chunk{Seq: seq, FileID: fid, MessageID: mid, Size: int64(len(piece)), Offset: int64(off), Transport: storage.TransportBot})
 		off = end
 	}
 	return chunks, nil
@@ -66,18 +66,18 @@ func (f *fakeBackend) get(fileID string) ([]byte, bool) {
 	return b, ok
 }
 
-func (f *fakeBackend) Download(_ context.Context, fileID string) (io.ReadCloser, error) {
-	b, ok := f.get(fileID)
+func (f *fakeBackend) Download(_ context.Context, ref storage.ChunkRef) (io.ReadCloser, error) {
+	b, ok := f.get(ref.BotFileID)
 	if !ok {
-		return nil, fmt.Errorf("no such file %s", fileID)
+		return nil, fmt.Errorf("no such file %s", ref.BotFileID)
 	}
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
-func (f *fakeBackend) DownloadRange(_ context.Context, fileID string, offset, length int64) (io.ReadCloser, error) {
-	b, ok := f.get(fileID)
+func (f *fakeBackend) DownloadRange(_ context.Context, ref storage.ChunkRef, offset, length int64) (io.ReadCloser, error) {
+	b, ok := f.get(ref.BotFileID)
 	if !ok {
-		return nil, fmt.Errorf("no such file %s", fileID)
+		return nil, fmt.Errorf("no such file %s", ref.BotFileID)
 	}
 	if offset > int64(len(b)) {
 		offset = int64(len(b))
@@ -89,12 +89,22 @@ func (f *fakeBackend) DownloadRange(_ context.Context, fileID string, offset, le
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
-func (f *fakeBackend) Delete(_ context.Context, messageID int64) error {
+func (f *fakeBackend) Delete(_ context.Context, ref storage.ChunkRef) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.deleted[messageID] = true
-	delete(f.files, fmt.Sprintf("f%d", messageID-1000))
+	f.deleted[ref.MessageID] = true
+	delete(f.files, fmt.Sprintf("f%d", ref.MessageID-1000))
 	return nil
+}
+
+func (f *fakeBackend) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) error {
+	var firstErr error
+	for _, r := range refs {
+		if err := f.Delete(ctx, r); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // --- test rig ---------------------------------------------------------------
@@ -511,19 +521,29 @@ func TestCompleteMultipartOverwriteReapsChunks(t *testing.T) {
 	}
 }
 
-// failingDeleteBackend wraps a backend and fails the first Delete call so
-// 8.5's "best-effort reap" branch can be exercised end-to-end.
+// failingDeleteBackend wraps a backend and fails the first reap call so
+// 8.5's "best-effort reap" branch can be exercised end-to-end. Phase 2
+// reaps via DeleteBatch (one call per overwrite); the wrapper fails it so
+// the PUT still 200s despite the cleanup error.
 type failingDeleteBackend struct {
 	storage.Backend
 	failNext bool
 }
 
-func (f *failingDeleteBackend) Delete(ctx context.Context, mid int64) error {
+func (f *failingDeleteBackend) Delete(ctx context.Context, ref storage.ChunkRef) error {
 	if f.failNext {
 		f.failNext = false
-		return fmt.Errorf("simulated telegram delete failure for %d", mid)
+		return fmt.Errorf("simulated telegram delete failure for %d", ref.MessageID)
 	}
-	return f.Backend.Delete(ctx, mid)
+	return f.Backend.Delete(ctx, ref)
+}
+
+func (f *failingDeleteBackend) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) error {
+	if f.failNext {
+		f.failNext = false
+		return fmt.Errorf("simulated telegram delete-batch failure for %d refs", len(refs))
+	}
+	return f.Backend.DeleteBatch(ctx, refs)
 }
 
 func md5hex(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }

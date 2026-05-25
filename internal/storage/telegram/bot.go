@@ -134,7 +134,7 @@ func (b *BotStorage) Upload(ctx context.Context, name, contentType string, body 
 
 func (b *BotStorage) cleanup(ctx context.Context, chunks []storage.Chunk) {
 	for _, c := range chunks {
-		if err := b.Delete(ctx, c.MessageID); err != nil && b.logger != nil {
+		if err := b.deleteMessage(ctx, c.MessageID); err != nil && b.logger != nil {
 			b.logger.Warn("cleanup orphaned chunk failed", "message_id", c.MessageID, "error", err)
 		}
 	}
@@ -248,11 +248,11 @@ func (b *BotStorage) sendChunkOnce(ctx context.Context, name, contentType string
 	if result.Result.Document.FileID == "" {
 		return storage.Chunk{}, fmt.Errorf("telegram response did not include document file_id")
 	}
-	return storage.Chunk{FileID: result.Result.Document.FileID, MessageID: result.Result.MessageID}, nil
+	return storage.Chunk{FileID: result.Result.Document.FileID, MessageID: result.Result.MessageID, Transport: storage.TransportBot}, nil
 }
 
-func (b *BotStorage) Download(ctx context.Context, fileID string) (io.ReadCloser, error) {
-	return b.DownloadRange(ctx, fileID, 0, 0)
+func (b *BotStorage) Download(ctx context.Context, ref storage.ChunkRef) (io.ReadCloser, error) {
+	return b.DownloadRange(ctx, ref, 0, 0)
 }
 
 // errFilePathGone is returned by fetchFile when the file CDN responds 404.
@@ -261,12 +261,16 @@ func (b *BotStorage) Download(ctx context.Context, fileID string) (io.ReadCloser
 // without help from the caller.
 var errFilePathGone = errors.New("telegram file path returned 404")
 
-// DownloadRange resolves fileID via getFile then fetches the file, optionally
-// requesting only [offset, offset+length). Telegram's file CDN honors HTTP
-// Range, which Phase 5 (Range GET) relies on. When pathCache is set the
+// DownloadRange resolves the chunk via getFile then fetches the file,
+// optionally requesting only [offset, offset+length). Telegram's file CDN
+// honors HTTP Range, which Range GET relies on. When pathCache is set the
 // resolved file_path is reused across calls; a 404 on the file GET means
 // the cached path expired, so we invalidate and resolve once more.
-func (b *BotStorage) DownloadRange(ctx context.Context, fileID string, offset, length int64) (io.ReadCloser, error) {
+//
+// Only ref.BotFileID is consulted under the Bot HTTP API; ref.MessageID and
+// ref.BotIndex carry through for Phase 3/4 dispatch.
+func (b *BotStorage) DownloadRange(ctx context.Context, ref storage.ChunkRef, offset, length int64) (io.ReadCloser, error) {
+	fileID := ref.BotFileID
 	if b.pathCache != nil {
 		if path, ok := b.pathCache.Get(fileID); ok {
 			rc, err := b.fetchFile(ctx, path, offset, length)
@@ -341,7 +345,32 @@ func (b *BotStorage) fetchFile(ctx context.Context, filePath string, offset, len
 	return downloadResp.Body, nil
 }
 
-func (b *BotStorage) Delete(ctx context.Context, messageID int64) error {
+func (b *BotStorage) Delete(ctx context.Context, ref storage.ChunkRef) error {
+	return b.deleteMessage(ctx, ref.MessageID)
+}
+
+// DeleteBatch fan-outs Delete serially over refs. The Bot HTTP API has no
+// batched deleteMessages; Phase 4's MTProto backend will override this with
+// channels.deleteMessages at 100 refs/call. Returns the first error
+// encountered; subsequent failures are logged.
+func (b *BotStorage) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) error {
+	var firstErr error
+	for _, ref := range refs {
+		if err := b.deleteMessage(ctx, ref.MessageID); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if b.logger != nil {
+				b.logger.Warn("batch delete failed", "message_id", ref.MessageID, "error", err)
+			}
+		}
+	}
+	return firstErr
+}
+
+// deleteMessage is the raw deleteMessage call shared by Delete, DeleteBatch,
+// and the upload-cleanup path (which only has message IDs in flight).
+func (b *BotStorage) deleteMessage(ctx context.Context, messageID int64) error {
 	form := url.Values{"chat_id": {b.chatID}, "message_id": {strconv.FormatInt(messageID, 10)}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL("deleteMessage"), strings.NewReader(form.Encode()))
 	if err != nil {

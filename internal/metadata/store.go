@@ -50,12 +50,21 @@ type Object struct {
 
 // Chunk mirrors storage.Chunk for persistence (the layers stay decoupled; the
 // handler converts between them, as it already does for Object).
+//
+// Transport and BotIndex are present in-memory in Phase 2 to keep the
+// metadata <-> storage conversion lossless, but the SQLite schema does NOT
+// yet have columns for them — every Get* method leaves both at the zero
+// value. Phase 3 adds the columns + a backfill so chunked rows persist
+// (Transport="bot", BotIndex=0). The dispatcher treats Transport == ""
+// as "bot" so a pre-Phase-3 row routes through BotStorage unchanged.
 type Chunk struct {
 	Seq       int
 	FileID    string
 	MessageID int64
 	Size      int64
 	Offset    int64
+	Transport string
+	BotIndex  int
 }
 
 // Open opens the metadata store with the default reader-pool size (8). Use

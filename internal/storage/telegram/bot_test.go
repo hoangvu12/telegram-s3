@@ -153,7 +153,7 @@ func TestUploadSplitsReassemblesDeletes(t *testing.T) {
 	// Reassemble via Download in order == original bytes.
 	var got bytes.Buffer
 	for _, c := range chunks {
-		rc, err := b.Download(ctx, c.FileID)
+		rc, err := b.Download(ctx, c.Ref())
 		if err != nil {
 			t.Fatalf("download %s: %v", c.FileID, err)
 		}
@@ -165,7 +165,7 @@ func TestUploadSplitsReassemblesDeletes(t *testing.T) {
 	}
 
 	// Ranged read within the first chunk (bytes [2,5)).
-	rc, err := b.DownloadRange(ctx, chunks[0].FileID, 2, 3)
+	rc, err := b.DownloadRange(ctx, chunks[0].Ref(), 2, 3)
 	if err != nil {
 		t.Fatalf("range: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestUploadSplitsReassemblesDeletes(t *testing.T) {
 
 	// Delete reaches deleteMessage for each chunk's message.
 	for _, c := range chunks {
-		if err := b.Delete(ctx, c.MessageID); err != nil {
+		if err := b.Delete(ctx, c.Ref()); err != nil {
 			t.Fatalf("delete %d: %v", c.MessageID, err)
 		}
 		if !f.deleted[c.MessageID] {
@@ -350,7 +350,7 @@ func TestDownloadCachesFilePath(t *testing.T) {
 
 	const reads = 5
 	for i := 0; i < reads; i++ {
-		rc, err := b.DownloadRange(ctx, chunks[0].FileID, 0, 0)
+		rc, err := b.DownloadRange(ctx, chunks[0].Ref(), 0, 0)
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}
@@ -385,7 +385,7 @@ func TestDownloadInvalidatesOnCDN404(t *testing.T) {
 	}
 
 	// Warm the cache so a stale path exists to invalidate.
-	rc, err := b.DownloadRange(ctx, chunks[0].FileID, 0, 0)
+	rc, err := b.DownloadRange(ctx, chunks[0].Ref(), 0, 0)
 	if err != nil {
 		t.Fatalf("warm: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestDownloadInvalidatesOnCDN404(t *testing.T) {
 	gfBefore := f.getFileCalls
 	f.mu.Unlock()
 
-	rc, err = b.DownloadRange(ctx, chunks[0].FileID, 0, 0)
+	rc, err = b.DownloadRange(ctx, chunks[0].Ref(), 0, 0)
 	if err != nil {
 		t.Fatalf("expected one-shot retry to succeed, got: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestDownloadNoCache(t *testing.T) {
 	}
 	const reads = 3
 	for i := 0; i < reads; i++ {
-		rc, err := b.Download(ctx, chunks[0].FileID)
+		rc, err := b.Download(ctx, chunks[0].Ref())
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}

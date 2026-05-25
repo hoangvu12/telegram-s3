@@ -22,6 +22,7 @@ import (
 
 	"telegram-s3/internal/config"
 	"telegram-s3/internal/metadata"
+	"telegram-s3/internal/reader"
 	"telegram-s3/internal/storage"
 )
 
@@ -286,16 +287,18 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 // messages after a successful overwrite. A failure here is logged but never
 // 5xx's the now-durable write — the new object is already authoritative.
 func (h *Handler) reapSupersededChunks(ctx context.Context, oldChunks []metadata.Chunk, prev metadata.Object) {
-	for _, c := range oldChunks {
-		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
-			h.logger.Warn("reap superseded chunk failed", "message_id", c.MessageID, "error", derr)
+	refs := chunkRefs(oldChunks)
+	if len(refs) > 0 {
+		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+			h.logger.Warn("reap superseded chunks failed", "count", len(refs), "error", derr)
 		}
 	}
 	// Legacy single-message row (pre-Phase-3): no object_chunks rows but a
 	// non-zero TelegramMessageID. Reap that one too. Empty objects (Size==0)
 	// never had a Telegram message, so skip them.
 	if len(oldChunks) == 0 && prev.Size > 0 && prev.TelegramMessageID != 0 {
-		if derr := h.backend.Delete(ctx, prev.TelegramMessageID); derr != nil && h.logger != nil {
+		ref := storage.ChunkRef{Transport: storage.TransportBot, BotFileID: prev.TelegramFileID, MessageID: prev.TelegramMessageID}
+		if derr := h.backend.Delete(ctx, ref); derr != nil && h.logger != nil {
 			h.logger.Warn("reap legacy superseded object failed", "message_id", prev.TelegramMessageID, "error", derr)
 		}
 	}
@@ -335,18 +338,55 @@ func (h *Handler) validateDecodedSize(w http.ResponseWriter, r *http.Request, go
 func toMetaChunks(chunks []storage.Chunk) []metadata.Chunk {
 	mc := make([]metadata.Chunk, len(chunks))
 	for i, c := range chunks {
-		mc[i] = metadata.Chunk{Seq: c.Seq, FileID: c.FileID, MessageID: c.MessageID, Size: c.Size, Offset: c.Offset}
+		mc[i] = metadata.Chunk{Seq: c.Seq, FileID: c.FileID, MessageID: c.MessageID, Size: c.Size, Offset: c.Offset, Transport: c.Transport, BotIndex: c.BotIndex}
 	}
 	return mc
+}
+
+// chunkRefs converts a metadata.Chunk slice into the ChunkRef slice the
+// Backend interface consumes. Transport defaults to "bot" for pre-Phase-3
+// rows that were stored before the column existed.
+func chunkRefs(chunks []metadata.Chunk) []storage.ChunkRef {
+	if len(chunks) == 0 {
+		return nil
+	}
+	refs := make([]storage.ChunkRef, len(chunks))
+	for i, c := range chunks {
+		t := c.Transport
+		if t == "" {
+			t = storage.TransportBot
+		}
+		refs[i] = storage.ChunkRef{Transport: t, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+	}
+	return refs
+}
+
+// storageChunkRefs is the same conversion for a freshly-uploaded
+// storage.Chunk slice (so failed-put cleanup and DeleteBatch share one path).
+func storageChunkRefs(chunks []storage.Chunk) []storage.ChunkRef {
+	if len(chunks) == 0 {
+		return nil
+	}
+	refs := make([]storage.ChunkRef, len(chunks))
+	for i, c := range chunks {
+		t := c.Transport
+		if t == "" {
+			t = storage.TransportBot
+		}
+		refs[i] = storage.ChunkRef{Transport: t, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+	}
+	return refs
 }
 
 // deleteChunks best-effort removes the Telegram messages for chunks that were
 // uploaded but whose object was then rejected/failed to persist.
 func (h *Handler) deleteChunks(ctx context.Context, chunks []storage.Chunk) {
-	for _, c := range chunks {
-		if err := h.backend.Delete(ctx, c.MessageID); err != nil && h.logger != nil {
-			h.logger.Warn("cleanup chunk after failed put", "message_id", c.MessageID, "error", err)
-		}
+	refs := storageChunkRefs(chunks)
+	if len(refs) == 0 {
+		return
+	}
+	if err := h.backend.DeleteBatch(ctx, refs); err != nil && h.logger != nil {
+		h.logger.Warn("cleanup chunks after failed put", "count", len(refs), "error", err)
 	}
 }
 
@@ -411,145 +451,103 @@ func (h *Handler) getObject(ctx context.Context, w http.ResponseWriter, r *http.
 		w.WriteHeader(http.StatusOK)
 	}
 
-	h.streamSegments(ctx, w, objectSegments(obj, chunks, useRange, rng), writeHeaders)
+	var rngPtr *httpRange
+	if useRange {
+		rngPtr = &rng
+	}
+	h.streamObject(ctx, w, obj, chunks, rngPtr, writeHeaders)
 }
 
-// objectSegments maps an object — chunked, legacy single-message, or empty —
-// to the ordered single-chunk reads that reconstruct it, optionally restricted
-// to an inclusive byte range. length 0 in a readSegment means "whole chunk"
-// (storage.Backend contract), so the full-object and legacy paths reuse the
-// ranged streamer (a full read is every chunk at no offset). This is the
-// shared core of getObject's streamer and openObject (CopyObject /
-// UploadPartCopy) — they must not diverge.
-func objectSegments(obj metadata.Object, chunks []metadata.Chunk, useRange bool, rng httpRange) []readSegment {
-	var segs []readSegment
-	switch {
-	case len(chunks) > 0:
-		for _, c := range chunks {
-			if !useRange {
-				segs = append(segs, readSegment{c.FileID, 0, 0})
-				continue
-			}
-			if c.Offset >= rng.end+1 || c.Offset+c.Size <= rng.start {
-				continue // chunk lies entirely outside the requested range
-			}
-			localOff := int64(0)
-			if rng.start > c.Offset {
-				localOff = rng.start - c.Offset
-			}
-			localEnd := c.Size - 1
-			if rng.end < c.Offset+c.Size-1 {
-				localEnd = rng.end - c.Offset
-			}
-			segs = append(segs, readSegment{c.FileID, localOff, localEnd - localOff + 1})
-		}
-	case obj.Size == 0:
-		// Empty object: a range on size 0 is 416'd before this, so this is
-		// only ever the full (empty) read — no segments.
-	default: // legacy single-message object (pre-Phase-3)
-		if useRange {
-			segs = append(segs, readSegment{obj.TelegramFileID, rng.start, rng.length()})
-		} else {
-			segs = append(segs, readSegment{obj.TelegramFileID, 0, 0})
-		}
+// planRead converts an object + its chunk map + optional range into the
+// (locs, start, end) triple the parallel prefetch reader consumes. Legacy
+// single-message objects (pre-Phase-3) collapse to a single ChunkLoc
+// covering the whole object. Empty objects yield no locs and start==end,
+// so the caller can short-circuit before constructing a reader.
+func (h *Handler) planRead(obj metadata.Object, chunks []metadata.Chunk, rng *httpRange) ([]reader.ChunkLoc, int64, int64) {
+	var start, end int64
+	if rng != nil {
+		start = rng.start
+		end = rng.end + 1
+	} else {
+		end = obj.Size
 	}
-	return segs
+
+	if len(chunks) > 0 {
+		locs := make([]reader.ChunkLoc, 0, len(chunks))
+		for _, c := range chunks {
+			locs = append(locs, reader.ChunkLoc{Ref: metaChunkRef(c), Offset: c.Offset, Size: c.Size})
+		}
+		return locs, start, end
+	}
+	if obj.Size > 0 {
+		// Legacy single-message object (pre-Phase-3): one loc spans
+		// the whole object.
+		return []reader.ChunkLoc{{
+			Ref:    storage.ChunkRef{Transport: storage.TransportBot, BotFileID: obj.TelegramFileID, MessageID: obj.TelegramMessageID},
+			Offset: 0,
+			Size:   obj.Size,
+		}}, start, end
+	}
+	return nil, start, end
+}
+
+// metaChunkRef builds a ChunkRef from a single metadata.Chunk row, applying
+// the Transport-defaults-to-"bot" rule for legacy rows.
+func metaChunkRef(c metadata.Chunk) storage.ChunkRef {
+	t := c.Transport
+	if t == "" {
+		t = storage.TransportBot
+	}
+	return storage.ChunkRef{Transport: t, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+}
+
+// newPrefetchReader constructs a parallel-prefetch reader over the given
+// locs + range. The caller must Prime() before committing any HTTP
+// status line so a chunk-0 failure surfaces as 502 (not a truncated 200).
+func (h *Handler) newPrefetchReader(ctx context.Context, objSize int64, locs []reader.ChunkLoc, start, end int64) *reader.Reader {
+	src := reader.NewBotSource(h.backend, objSize, locs, h.cfg.StreamChunkSize)
+	return reader.New(ctx, src, start, end,
+		h.cfg.StreamConcurrency, h.cfg.StreamBuffers, h.cfg.ChunkTimeout)
 }
 
 // openObject returns a reader over the whole object (rng == nil) or an
-// inclusive sub-range, chaining backend.DownloadRange across the chunk map.
-// The first segment is opened eagerly so a backend failure surfaces to the
-// caller (which is about to stream the bytes into backend.Upload) rather than
-// mid-copy. An empty object yields an empty reader.
+// inclusive sub-range. Uses the parallel-prefetch reader (Phase 2) so
+// CopyObject / UploadPartCopy fan-out as well. Prime() runs synchronously
+// before this returns so a backend failure surfaces to the caller
+// (typically about to stream into backend.Upload) without committing
+// half-finished bytes. An empty object yields an empty reader.
 func (h *Handler) openObject(ctx context.Context, obj metadata.Object, chunks []metadata.Chunk, rng *httpRange) (io.ReadCloser, error) {
-	var rr httpRange
-	if rng != nil {
-		rr = *rng
-	}
-	segs := objectSegments(obj, chunks, rng != nil, rr)
-	if len(segs) == 0 {
+	locs, start, end := h.planRead(obj, chunks, rng)
+	if start >= end {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
-	first, err := h.backend.DownloadRange(ctx, segs[0].fileID, segs[0].off, segs[0].length)
-	if err != nil {
+	pr := h.newPrefetchReader(ctx, obj.Size, locs, start, end)
+	if err := pr.Prime(); err != nil && err != io.EOF {
+		pr.Close()
 		return nil, err
 	}
-	return &segmentReader{ctx: ctx, h: h, rest: segs[1:], cur: first}, nil
+	return pr, nil
 }
 
-// segmentReader concatenates the per-chunk readers of an object, opening each
-// next segment lazily as the previous one is exhausted.
-type segmentReader struct {
-	ctx  context.Context
-	h    *Handler
-	rest []readSegment
-	cur  io.ReadCloser
-}
-
-func (s *segmentReader) Read(p []byte) (int, error) {
-	for {
-		if s.cur == nil {
-			if len(s.rest) == 0 {
-				return 0, io.EOF
-			}
-			seg := s.rest[0]
-			s.rest = s.rest[1:]
-			rc, err := s.h.backend.DownloadRange(s.ctx, seg.fileID, seg.off, seg.length)
-			if err != nil {
-				return 0, err
-			}
-			s.cur = rc
-		}
-		n, err := s.cur.Read(p)
-		if err == io.EOF {
-			s.cur.Close()
-			s.cur = nil
-			if n > 0 {
-				return n, nil // surface EOF on the next call
-			}
-			continue
-		}
-		return n, err
-	}
-}
-
-func (s *segmentReader) Close() error {
-	if s.cur != nil {
-		return s.cur.Close()
-	}
-	return nil
-}
-
-// streamSegments opens the first source before the status line is committed so
-// a backend failure surfaces as 502 (not a truncated 200/206). Once streaming
-// has begun a later-chunk failure can only abort the connection.
-func (h *Handler) streamSegments(ctx context.Context, w http.ResponseWriter, segs []readSegment, writeHeaders func()) {
-	if len(segs) == 0 {
+// streamObject streams the requested range of an object to w using the
+// parallel-prefetch reader. The first chunk is Primed before the status
+// line is committed so a backend failure becomes HTTP 502 (not a
+// truncated 200/206). Once headers have been written a later-chunk
+// failure can only abort the connection.
+func (h *Handler) streamObject(ctx context.Context, w http.ResponseWriter, obj metadata.Object, chunks []metadata.Chunk, rng *httpRange, writeHeaders func()) {
+	locs, start, end := h.planRead(obj, chunks, rng)
+	if start >= end {
 		writeHeaders()
 		return
 	}
-	first, err := h.backend.DownloadRange(ctx, segs[0].fileID, segs[0].off, segs[0].length)
-	if err != nil {
+	pr := h.newPrefetchReader(ctx, obj.Size, locs, start, end)
+	defer pr.Close()
+	if err := pr.Prime(); err != nil && err != io.EOF {
 		h.writeError(w, http.StatusBadGateway, "TelegramDownloadFailed", err.Error())
 		return
 	}
 	writeHeaders()
-	_, _ = io.Copy(w, first)
-	first.Close()
-	for _, s := range segs[1:] {
-		rc, err := h.backend.DownloadRange(ctx, s.fileID, s.off, s.length)
-		if err != nil {
-			return // status already sent; abort the stream
-		}
-		_, _ = io.Copy(w, rc)
-		rc.Close()
-	}
-}
-
-type readSegment struct {
-	fileID string
-	off    int64
-	length int64 // 0 == to end of chunk (storage.Backend contract)
+	_, _ = io.Copy(w, pr)
 }
 
 // httpRange is a resolved, satisfiable, inclusive byte range [start,end].
@@ -681,13 +679,13 @@ func (h *Handler) deleteOneObject(ctx context.Context, bucket, key string) error
 	}
 
 	if len(chunks) > 0 {
-		for _, c := range chunks {
-			if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
-				h.logger.Warn("delete telegram chunk failed", "key", key, "message_id", c.MessageID, "error", derr)
-			}
+		refs := chunkRefs(chunks)
+		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+			h.logger.Warn("delete telegram chunks failed", "key", key, "count", len(refs), "error", derr)
 		}
 	} else if obj.Size > 0 && obj.TelegramMessageID != 0 { // legacy single-message
-		if derr := h.backend.Delete(ctx, obj.TelegramMessageID); derr != nil && h.logger != nil {
+		ref := storage.ChunkRef{Transport: storage.TransportBot, BotFileID: obj.TelegramFileID, MessageID: obj.TelegramMessageID}
+		if derr := h.backend.Delete(ctx, ref); derr != nil && h.logger != nil {
 			h.logger.Warn("delete telegram object failed", "key", key, "error", derr)
 		}
 	}

@@ -131,9 +131,9 @@ func (h *Handler) uploadPart(ctx context.Context, w http.ResponseWriter, r *http
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
-	for _, c := range old {
-		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
-			h.logger.Warn("reap superseded part chunk failed", "message_id", c.MessageID, "error", derr)
+	if refs := chunkRefs(old); len(refs) > 0 {
+		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+			h.logger.Warn("reap superseded part chunks failed", "count", len(refs), "error", derr)
 		}
 	}
 
@@ -256,9 +256,9 @@ func (h *Handler) abortUploadInternal(ctx context.Context, uploadID string) erro
 	if err != nil {
 		return err
 	}
-	for _, c := range all {
-		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
-			h.logger.Warn("abort: delete part chunk failed", "message_id", c.MessageID, "error", derr)
+	if refs := chunkRefs(all); len(refs) > 0 {
+		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+			h.logger.Warn("abort: delete part chunks failed", "count", len(refs), "error", derr)
 		}
 	}
 	return h.store.DeleteMultipartUpload(ctx, uploadID)

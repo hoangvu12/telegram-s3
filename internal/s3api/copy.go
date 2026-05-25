@@ -104,9 +104,9 @@ func (h *Handler) copyObject(ctx context.Context, w http.ResponseWriter, r *http
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
-	for _, c := range old {
-		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
-			h.logger.Warn("reap superseded object chunk on copy", "message_id", c.MessageID, "error", derr)
+	if refs := chunkRefs(old); len(refs) > 0 {
+		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+			h.logger.Warn("reap superseded object chunks on copy", "count", len(refs), "error", derr)
 		}
 	}
 
@@ -163,9 +163,9 @@ func (h *Handler) uploadPartCopy(ctx context.Context, w http.ResponseWriter, r *
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
-	for _, c := range oldChunks {
-		if derr := h.backend.Delete(ctx, c.MessageID); derr != nil && h.logger != nil {
-			h.logger.Warn("reap superseded part chunk on copy", "message_id", c.MessageID, "error", derr)
+	if refs := chunkRefs(oldChunks); len(refs) > 0 {
+		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+			h.logger.Warn("reap superseded part chunks on copy", "count", len(refs), "error", derr)
 		}
 	}
 
