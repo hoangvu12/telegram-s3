@@ -195,6 +195,28 @@ CREATE TABLE IF NOT EXISTS multipart_upload_metadata (
   value TEXT NOT NULL,
   PRIMARY KEY (upload_id, name)
 );
+
+-- Phase 4: gotd MTProto session blobs, one row per bot. Partial writes
+-- would force the bot to re-auth (auth.importBotAuthorization) and trip
+-- flood control, so the session.Storage adapter upserts inside a tx.
+CREATE TABLE IF NOT EXISTS tg_sessions (
+  key TEXT PRIMARY KEY,
+  value BLOB NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- Phase 4: grace-delete buffer for the migration sweeper. After
+-- pass-1 atomically swaps a bot chunk to mtproto, the old (message_id,
+-- bot_index) lands here; pass-2 reaps it once cfg.BotDeleteGrace has
+-- passed. See PHASES.md decision #14 for why the bot delete cannot
+-- be done in the same tx as the row swap.
+CREATE TABLE IF NOT EXISTS bot_chunks_pending_delete (
+  message_id INTEGER NOT NULL,
+  bot_index INTEGER NOT NULL,
+  swapped_at TEXT NOT NULL,
+  PRIMARY KEY (message_id, bot_index)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_chunks_pending_delete_swapped_at ON bot_chunks_pending_delete(swapped_at);
 `); err != nil {
 		return err
 	}
@@ -892,6 +914,186 @@ func (s *Store) DeleteMultipartUpload(ctx context.Context, uploadID string) erro
 		return err
 	}
 	return tx.Commit()
+}
+
+// --- Phase 4: MTProto session storage --------------------------------------
+
+// LoadSession returns the raw session blob for the given key, or
+// ErrNotFound if no session has been stored yet. The bot's first boot
+// after deploy goes through ErrNotFound, which gotd's session.Loader
+// translates into a fresh auth.importBotAuthorization call.
+func (s *Store) LoadSession(ctx context.Context, key string) ([]byte, error) {
+	var data []byte
+	err := s.read.QueryRowContext(ctx, `SELECT value FROM tg_sessions WHERE key = ?`, key).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return data, err
+}
+
+// StoreSession upserts the session blob for the given key. The write
+// goes through the single-conn writer pool so two bots saving the same
+// key cannot tear (gotd's session is a self-consistent blob and a
+// partial overwrite would force a re-auth + flood-control penalty).
+func (s *Store) StoreSession(ctx context.Context, key string, data []byte) error {
+	_, err := s.write.ExecContext(ctx, `
+INSERT INTO tg_sessions(key, value, updated_at) VALUES(?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+`, key, data, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// --- Phase 4: migration sweeper helpers ------------------------------------
+
+// BotChunkLoc identifies one Bot-API chunk that the sweeper considers
+// for migration to MTProto. The sweeper downloads via BotStorage using
+// (FileID, MessageID, BotIndex) and then re-uploads, swapping the row
+// via SwapBotChunkToMtproto.
+type BotChunkLoc struct {
+	Bucket    string
+	Key       string
+	PartSeq   int
+	Offset    int64
+	Size      int64
+	FileID    string
+	MessageID int64
+	BotIndex  int
+}
+
+// ListBotChunksOldestFirst returns up to `limit` object_chunks rows
+// with transport='bot', sorted by the parent object's updated_at
+// ascending — so the oldest data drains first. The join is cheap
+// because (bucket, key) is the object_chunks primary key prefix.
+func (s *Store) ListBotChunksOldestFirst(ctx context.Context, limit int) ([]BotChunkLoc, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT oc.bucket, oc.key, oc.part_seq, oc.offset, oc.size,
+       oc.telegram_file_id, oc.telegram_message_id, oc.bot_index
+FROM object_chunks oc
+JOIN objects o ON o.bucket = oc.bucket AND o.key = oc.key
+WHERE oc.transport = 'bot' AND o.deleted_at IS NULL
+ORDER BY o.updated_at ASC, oc.bucket ASC, oc.key ASC, oc.part_seq ASC
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BotChunkLoc
+	for rows.Next() {
+		var c BotChunkLoc
+		if err := rows.Scan(&c.Bucket, &c.Key, &c.PartSeq, &c.Offset, &c.Size, &c.FileID, &c.MessageID, &c.BotIndex); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SwapBotChunkToMtproto is the load-bearing pass-1 atomic op of the
+// sweeper. In one transaction it (a) updates the chunk row to point at
+// the freshly-uploaded MTProto message, and (b) records the old bot
+// (message_id, bot_index) in bot_chunks_pending_delete so pass-2 can
+// reap it after the grace window. The two writes MUST share a tx — a
+// crash between them either leaves the bot message readable
+// indefinitely (if only the insert ran) or breaks reads (if only the
+// update ran). Both are correctness violations.
+//
+// The pre-update guard `WHERE part_seq=? AND transport='bot'` makes
+// double-application a no-op: a second invocation finds the row
+// already mtproto and silently affects 0 rows (the duplicate insert
+// is then a unique-key conflict, which we ignore — see ON CONFLICT).
+func (s *Store) SwapBotChunkToMtproto(ctx context.Context, bucket, key string, partSeq int, oldMessageID int64, oldBotIndex int, newMessageID int64, newBotIndex int, swappedAt time.Time) error {
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE object_chunks
+   SET transport = 'mtproto',
+       telegram_message_id = ?,
+       bot_index = ?,
+       telegram_file_id = ''
+ WHERE bucket = ? AND key = ? AND part_seq = ? AND transport = 'bot'
+`, newMessageID, newBotIndex, bucket, key, partSeq)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		// Another pass-1 already migrated this row, or the parent object was
+		// deleted underneath us. Either way pass-2 has nothing new to do; we
+		// also do NOT insert into pending_delete because the old bot message
+		// was already enqueued (or already reaped).
+		return tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO bot_chunks_pending_delete(message_id, bot_index, swapped_at)
+VALUES(?, ?, ?)
+ON CONFLICT(message_id, bot_index) DO UPDATE SET swapped_at = excluded.swapped_at
+`, oldMessageID, oldBotIndex, swappedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// PendingDelete is one row from bot_chunks_pending_delete — the
+// sweeper's pass-2 reaps these after swapped_at + cfg.BotDeleteGrace.
+type PendingDelete struct {
+	MessageID int64
+	BotIndex  int
+	SwappedAt time.Time
+}
+
+// PendingDeletesOlderThan returns up to `limit` pending-delete rows
+// whose swapped_at is strictly before `before`. Ordered oldest-first
+// so a tight rate cap drains the worst backlog first.
+func (s *Store) PendingDeletesOlderThan(ctx context.Context, before time.Time, limit int) ([]PendingDelete, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT message_id, bot_index, swapped_at
+FROM bot_chunks_pending_delete
+WHERE swapped_at < ?
+ORDER BY swapped_at ASC
+LIMIT ?
+`, before.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingDelete
+	for rows.Next() {
+		var p PendingDelete
+		var swapped string
+		if err := rows.Scan(&p.MessageID, &p.BotIndex, &swapped); err != nil {
+			return nil, err
+		}
+		p.SwappedAt, _ = time.Parse(time.RFC3339Nano, swapped)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// DeletePendingDelete removes one pending-delete row after the
+// sweeper's pass-2 has successfully deleted the bot message. A
+// failure here is harmless — the row stays and the next pass-2 tries
+// the bot delete again (Telegram's deleteMessage is idempotent on a
+// message that's already gone).
+func (s *Store) DeletePendingDelete(ctx context.Context, messageID int64, botIndex int) error {
+	_, err := s.write.ExecContext(ctx, `
+DELETE FROM bot_chunks_pending_delete WHERE message_id = ? AND bot_index = ?
+`, messageID, botIndex)
+	return err
+}
+
+// CountBotChunks returns the number of object_chunks rows still on
+// the Bot HTTP API transport. Exposed for ops/observability: when this
+// hits zero the sweeper has drained, and the operator can flip
+// TELEGRAM_TRANSPORT to "mtproto" and eventually delete the legacy bot.
+func (s *Store) CountBotChunks(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_chunks WHERE transport = 'bot'`).Scan(&n)
+	return n, err
 }
 
 func deleteMultipartTx(ctx context.Context, tx *sql.Tx, uploadID string) error {

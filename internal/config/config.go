@@ -72,6 +72,28 @@ type Config struct {
 	StreamBuffers     int
 	ChunkTimeout      time.Duration
 	StreamChunkSize   int64
+	// Phase 4 — MTProto backend + dispatcher knobs. Default
+	// TelegramTransport="bot" is a deploy-time no-op: only BotStorage
+	// runs and the dispatcher routes everything to it. Flip to "dual"
+	// to start writing new chunks via MTProto while old chunks keep
+	// reading via the Bot API (and the sweeper drains them in the
+	// background). Flip to "mtproto" only after the sweeper has
+	// drained every transport='bot' row.
+	TelegramTransport     string
+	TelegramAppID         int    // from my.telegram.org; required when transport != "bot"
+	TelegramAppHash       string // from my.telegram.org; required when transport != "bot"
+	TelegramPoolSize      int    // gotd pool.Pool size per bot (session multiplexing)
+	TelegramUploadThreads int    // uploader.WithThreads per upload
+	// MigrationRate is the sweeper's pass-1 throughput cap in rows/day.
+	// 0 disables the sweeper entirely (the dispatcher still routes new
+	// uploads via MTProto in dual mode, but no migration happens).
+	MigrationRate int
+	// BotDeleteGrace is how long a migrated bot message lingers in
+	// bot_chunks_pending_delete before the sweeper's pass-2 reaps it.
+	// See PHASES.md design decision #14: this window prevents a reader
+	// that fetched the chunk map just before the swap from 404'ing on a
+	// permanent delete. Minimum 1m; 0 forces immediate delete (test-only).
+	BotDeleteGrace time.Duration
 }
 
 func Load() (Config, error) {
@@ -96,6 +118,13 @@ func Load() (Config, error) {
 		StreamBuffers:           getInt("STREAM_BUFFERS", 8),
 		ChunkTimeout:            getDuration("CHUNK_TIMEOUT", 30*time.Second),
 		StreamChunkSize:         getBytes("STREAM_CHUNK_SIZE", 4<<20),
+		TelegramTransport:       strings.ToLower(getenv("TELEGRAM_TRANSPORT", "bot")),
+		TelegramAppID:           getInt("TELEGRAM_APP_ID", 0),
+		TelegramAppHash:         os.Getenv("TELEGRAM_APP_HASH"),
+		TelegramPoolSize:        getInt("TELEGRAM_POOL_SIZE", 4),
+		TelegramUploadThreads:   getInt("TELEGRAM_UPLOAD_THREADS", 8),
+		MigrationRate:           getIntNonNeg("MIGRATION_RATE", 100),
+		BotDeleteGrace:          getDuration("BOT_DELETE_GRACE", time.Hour),
 	}
 
 	// Soft-fallback to the pre-Phase-3 single-token env so a partial deploy
@@ -117,6 +146,32 @@ func Load() (Config, error) {
 	}
 	if cfg.TelegramChatID == "" {
 		return Config{}, errors.New("TELEGRAM_CHAT_ID is required")
+	}
+
+	// Phase 4 validation. The transport flag must be one of the three known
+	// values — a typo silently routing to "bot" would mask a misconfigured
+	// migration. MTProto-using transports need app credentials from
+	// my.telegram.org; "bot" leaves them optional so the legacy single-
+	// transport deploy boots without them.
+	switch cfg.TelegramTransport {
+	case "bot", "dual", "mtproto":
+	default:
+		return Config{}, fmt.Errorf("TELEGRAM_TRANSPORT=%q not recognized (want bot, dual, or mtproto)", cfg.TelegramTransport)
+	}
+	if cfg.TelegramTransport != "bot" {
+		if cfg.TelegramAppID <= 0 {
+			return Config{}, errors.New("TELEGRAM_APP_ID is required when TELEGRAM_TRANSPORT != bot (register an app at my.telegram.org)")
+		}
+		if cfg.TelegramAppHash == "" {
+			return Config{}, errors.New("TELEGRAM_APP_HASH is required when TELEGRAM_TRANSPORT != bot")
+		}
+	}
+	// Clamp the grace window to a safe production minimum so a typo like
+	// `BOT_DELETE_GRACE=10s` doesn't quietly enable the read-during-swap
+	// race. The explicit 0 value bypasses the clamp because tests rely on
+	// it to drive the immediate-delete path.
+	if cfg.BotDeleteGrace > 0 && cfg.BotDeleteGrace < time.Minute {
+		cfg.BotDeleteGrace = time.Minute
 	}
 
 	return cfg, nil
@@ -159,6 +214,18 @@ func getDuration(key string, fallback time.Duration) time.Duration {
 func getInt(key string, fallback int) int {
 	if value := os.Getenv(key); value != "" {
 		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+// getIntNonNeg is getInt's permissive cousin: it accepts 0 as a real value
+// (the "disable" sentinel for knobs like MIGRATION_RATE). A negative value
+// is still treated as invalid and falls back.
+func getIntNonNeg(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n >= 0 {
 			return n
 		}
 	}
