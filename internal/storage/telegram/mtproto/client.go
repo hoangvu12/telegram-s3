@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/contrib/middleware/ratelimit"
 	"github.com/gotd/td/telegram"
@@ -26,6 +27,19 @@ import (
 // to peel the prefix once at boot. Basic groups (-G) and DMs (+U)
 // are not supported transports.
 const supergroupPrefix = -1_000_000_000_000
+
+// retryMaxAttempts caps the retry middleware. teldrive uses 5 on its
+// hot path; we follow suit. The internal-error list it filters on is
+// already conservative, so 5 covers a typical Telegram-side wobble
+// without amplifying genuine outages.
+const retryMaxAttempts = 5
+
+// retryRecoveryTimeout caps the recovery middleware's total elapsed
+// wall time per RPC. 30s is long enough to ride out a gotd reconnect
+// (RetryInterval × MaxRetries ≈ 20s for a default client) but short
+// enough that a wedged transport doesn't silently extend caller
+// deadlines beyond what an upstream HTTP client would tolerate.
+const retryRecoveryTimeout = 30 * time.Second
 
 // ParseChannelID converts a Bot-API style chat_id like "-1001234567890"
 // to the raw channel_id (1234567890) that channels.* requires. A
@@ -176,13 +190,30 @@ func StartBot(ctx context.Context, opts BotOptions) (*MTProtoBot, error) {
 	sessionKey := fmt.Sprintf("bot:%d", opts.Index)
 	storage := NewSessionStorage(opts.Sessions, sessionKey)
 
-	// FLOOD_WAIT — the SimpleWaiter variant is stateless (no .Run
-	// loop), so the bot's run goroutine stays as simple as the docs'
-	// "auth + wait" pattern. Rate limit per teldrive: 5 calls per
-	// 100ms burst. Both apply on top of every RPC the *tg.Client
-	// issues, so the upload/download paths get them for free.
+	// The bot's run context outlives StartBot's ctx — we want callers'
+	// boot timeouts to cancel a stuck handshake (via the select on
+	// ready/ctx.Done below), but not to cancel an authenticated bot
+	// that's just sitting in its <-ctx.Done() block. runCtx is the
+	// independent lifetime for the steady-state client.
+	runCtx, cancel := context.WithCancel(context.Background())
+
+	// Middleware chain (outermost first): floodwait -> recovery ->
+	// retry -> ratelimit. Matches teldrive's hot-path layering.
+	//   - floodwait absorbs FLOOD_WAIT_n responses by sleeping and
+	//     re-invoking, so the retry budget below doesn't burn on rate
+	//     limits.
+	//   - recovery masks bare transport errors during gotd's reconnect
+	//     window (non-tgerr failures) with an exponential backoff
+	//     bounded by runCtx — bot shutdown unwinds in-flight retries.
+	//   - retry catches a curated set of transient server-side faults
+	//     (Timedout, RPC_CALL_FAIL, STORAGE_CHOOSE_VOLUME_FAILED, etc.)
+	//     learned from teldrive's production experience.
+	//   - ratelimit (innermost) paces every RPC at 5/100ms so a burst
+	//     of recovered/retried calls can't trip Telegram's anti-abuse.
 	mws := []telegram.Middleware{
 		floodwait.NewSimpleWaiter(),
+		newRecovery(runCtx, func() backoff.BackOff { return newRecoveryBackoff(retryRecoveryTimeout) }),
+		newRetry(retryMaxAttempts),
 		ratelimit.New(rate.Every(100*time.Millisecond), 5),
 	}
 
@@ -198,8 +229,6 @@ func StartBot(ctx context.Context, opts BotOptions) (*MTProtoBot, error) {
 		done:   make(chan struct{}),
 		logger: opts.Logger,
 	}
-
-	runCtx, cancel := context.WithCancel(context.Background())
 	bot.cancel = cancel
 
 	// ready signals StartBot the handshake finished (success or fail).

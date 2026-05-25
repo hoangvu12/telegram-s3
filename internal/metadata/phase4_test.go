@@ -41,6 +41,36 @@ func TestPhase4Migration(t *testing.T) {
 	}
 }
 
+// TestStoreSessionUpsert pins the upsert semantics of StoreSession.
+// teldrive shipped a fix in Feb 2026 (commit 4046b54) where their kv
+// Set() was insert-only — second writes silently no-op'd, so gotd's
+// rotated session bytes never made it to disk and authentication
+// failed at the next process restart. We use ON CONFLICT DO UPDATE,
+// but the test pins that contract so a future refactor doesn't
+// regress to insert-only without anyone noticing until prod re-auths.
+func TestStoreSessionUpsert(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "upsert.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.StoreSession(ctx, "bot:0", []byte("first")); err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	if err := s.StoreSession(ctx, "bot:0", []byte("second")); err != nil {
+		t.Fatalf("second store: %v", err)
+	}
+	got, err := s.LoadSession(ctx, "bot:0")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if string(got) != "second" {
+		t.Errorf("got %q; want %q — second StoreSession must overwrite, not silently skip", got, "second")
+	}
+}
+
 // TestSwapBotChunkToMtproto is the load-bearing pass-1 unit test: a
 // successful swap (a) flips the chunk row's transport/message_id/
 // bot_index/file_id, AND (b) inserts the OLD (message_id, bot_index)

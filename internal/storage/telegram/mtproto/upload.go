@@ -97,7 +97,97 @@ func (s *Storage) uploadChunk(ctx context.Context, bot *MTProtoBot, name, conten
 	if err != nil {
 		return storage.Chunk{}, fmt.Errorf("mtproto extract message id (bot %d seq %d): %w", bot.Index(), seq, err)
 	}
+
+	// Read back the message we just sent and confirm the server-side
+	// document size matches what we streamed. teldrive learned (commit
+	// 5b4faaa, Feb 2025) that sendMedia can return ok while the
+	// resulting document is short or zero-sized — surfacing only later
+	// as a corrupt GET. The send bucket cannot tolerate that, so we
+	// catch it at upload time and bounce. verifyUploadedSize deletes
+	// the bad message itself; the chunk just returns the error.
+	if err := s.verifyUploadedSize(ctx, bot, msgID, total); err != nil {
+		return storage.Chunk{}, fmt.Errorf("mtproto verify (bot %d seq %d): %w", bot.Index(), seq, err)
+	}
 	return storage.Chunk{MessageID: int64(msgID)}, nil
+}
+
+// verifyUploadedSize round-trips through channels.getMessages on the
+// freshly-uploaded message and confirms its document size equals the
+// expected bytes. On any mismatch (zero doc, missing media, wrong size)
+// the bot message is best-effort deleted so a corrupt body doesn't
+// linger in the channel as a zombie. The verify failure surfaces to
+// uploadChunk's caller, which triggers the standard cleanup path for
+// earlier chunks in the same Upload.
+func (s *Storage) verifyUploadedSize(ctx context.Context, bot *MTProtoBot, msgID int, expected int64) error {
+	api := bot.API()
+	ch := bot.Channel()
+	res, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash},
+		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
+	})
+	if err != nil {
+		return fmt.Errorf("channels.getMessages msg %d: %w", msgID, err)
+	}
+	modified, ok := res.AsModified()
+	if !ok {
+		s.deleteByMessageID(ctx, bot, msgID)
+		return fmt.Errorf("msg %d: notModified response on fresh verify", msgID)
+	}
+	msgs := modified.GetMessages()
+	if len(msgs) == 0 {
+		s.deleteByMessageID(ctx, bot, msgID)
+		return fmt.Errorf("msg %d: not found", msgID)
+	}
+	size, ok := inspectDocumentSize(msgs[0])
+	if !ok {
+		s.deleteByMessageID(ctx, bot, msgID)
+		return fmt.Errorf("msg %d: no document in message", msgID)
+	}
+	if size != expected {
+		s.deleteByMessageID(ctx, bot, msgID)
+		return fmt.Errorf("msg %d: size mismatch got=%d want=%d", msgID, size, expected)
+	}
+	return nil
+}
+
+// inspectDocumentSize returns (doc.Size, true) when msg carries a
+// non-empty document. Any other shape returns false — the verify path
+// treats those as upload failures rather than trying to interpret them.
+// Split out as a pure function so the size-mismatch / shape tests
+// don't need a *tg.Client mock.
+func inspectDocumentSize(msg tg.MessageClass) (int64, bool) {
+	res, ok := msg.AsNotEmpty()
+	if !ok {
+		return 0, false
+	}
+	m, ok := res.(*tg.Message)
+	if !ok {
+		return 0, false
+	}
+	media, ok := m.Media.(*tg.MessageMediaDocument)
+	if !ok || media == nil {
+		return 0, false
+	}
+	doc, ok := media.Document.AsNotEmpty()
+	if !ok {
+		return 0, false
+	}
+	return doc.Size, true
+}
+
+// deleteByMessageID best-effort removes a single message via the
+// passed bot's API. Verify-fail cleanup — failures here are logged
+// and swallowed since the verify error is the load-bearing one.
+func (s *Storage) deleteByMessageID(ctx context.Context, bot *MTProtoBot, msgID int) {
+	api := bot.API()
+	ch := bot.Channel()
+	if _, err := api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
+		Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash},
+		ID:      []int{msgID},
+	}); err != nil && s.logger != nil {
+		s.logger.Warn("mtproto verify-fail cleanup delete failed",
+			"bot", bot.Index(), "msg", msgID, "error", err)
+	}
 }
 
 // cleanup best-effort deletes chunks already uploaded when a later
