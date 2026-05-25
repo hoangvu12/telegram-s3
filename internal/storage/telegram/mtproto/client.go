@@ -61,17 +61,31 @@ type BotOptions struct {
 	// across bots on cold boot. Telegram throttles concurrent bot
 	// auths from the same IP; 200ms × index is empirically safe.
 	AuthDelay time.Duration
+	// PoolSize sets the gotd per-DC session-pool capacity for the bot's
+	// hot-path RPCs (download fetchRange, upload uploadChunk). 0 falls
+	// back to 1 (single-session, pre-pool behavior). The pool is shared
+	// per bot — N bots × PoolSize sessions total. Sized too high will
+	// trip Telegram's per-key connection caps; 4 is the empirical
+	// sweet spot for parallel-prefetch reads on a 1 GiB object.
+	PoolSize int
 }
 
 // MTProtoBot is one authenticated gotd client + its cached channel
 // resolver. The Run goroutine stays alive until Close. Concurrent
 // callers may use the *tg.Client returned by API() freely; gotd
 // multiplexes requests over its internal connection pool.
+//
+// sessions wraps an additional gotd Pool that multiplexes a single
+// bot's RPCs across many MTProto sessions — the parallel-prefetch
+// reader's STREAM_CONCURRENCY would otherwise serialize through
+// gotd's one default session. Built once during StartBot after auth;
+// hot-path callers go through Session(ctx) instead of API().
 type MTProtoBot struct {
 	index    int
 	api      *tg.Client
 	client   *telegram.Client
 	channel  *tg.InputChannel
+	sessions *sessionPool
 	cancel   context.CancelFunc
 	done     chan struct{}
 	runErr   atomic.Pointer[error]
@@ -82,9 +96,25 @@ type MTProtoBot struct {
 // persisted in Chunk.BotIndex when this bot uploads a chunk.
 func (b *MTProtoBot) Index() int { return b.index }
 
-// API exposes the raw *tg.Client. Safe for concurrent use across
-// goroutines (gotd serializes RPC framing internally).
+// API exposes the raw *tg.Client tied to gotd's single default
+// session. Safe for concurrent use, but RPCs serialize through one
+// MTProto session. Prefer Session(ctx) for hot-path calls (parallel
+// range reads / parallel chunk uploads); keep API() for one-shot
+// calls (delete) and tests that pre-date the session pool.
 func (b *MTProtoBot) API() *tg.Client { return b.api }
+
+// Session returns a *tg.Client whose RPCs flow through the bot's
+// session pool, multiplexing up to PoolSize concurrent invocations
+// across distinct MTProto sessions. Falls back to API() if the pool
+// wasn't built (PoolSize <= 1 or a pool-init failure logged during
+// StartBot). Safe for concurrent use; callers don't need to cache
+// the result.
+func (b *MTProtoBot) Session(ctx context.Context) *tg.Client {
+	if b.sessions == nil {
+		return b.api
+	}
+	return b.sessions.Client(ctx)
+}
 
 // Channel returns the cached *tg.InputChannel resolved at boot.
 // Embedding the access hash in the cached value keeps the hot path
@@ -102,9 +132,15 @@ func (b *MTProtoBot) Err() error {
 	return nil
 }
 
-// Close cancels the run goroutine and waits for it to exit.
-// Idempotent.
+// Close cancels the run goroutine and waits for it to exit. The
+// session pool's connections are released first so the gotd Run loop
+// doesn't tear them down mid-RPC. Idempotent.
 func (b *MTProtoBot) Close() {
+	if b.sessions != nil {
+		if err := b.sessions.Close(); err != nil && b.logger != nil {
+			b.logger.Warn("mtproto session pool close failed", "index", b.index, "error", err)
+		}
+	}
 	if b.cancel != nil {
 		b.cancel()
 	}
@@ -205,10 +241,24 @@ func StartBot(ctx context.Context, opts BotOptions) (*MTProtoBot, error) {
 			}
 			bot.channel = ch
 
+			// Auth done — the client is past Run handshake, so
+			// Config().ThisDC is valid and the session pool can be
+			// built. Construction itself doesn't open connections
+			// (gotd lazy-opens on first Client(ctx) call); we just
+			// register the size + middleware chain here so the
+			// readers/uploaders can see a non-nil bot.sessions
+			// immediately after ready.
+			poolSize := opts.PoolSize
+			if poolSize < 1 {
+				poolSize = 1
+			}
+			bot.sessions = newSessionPool(client, int64(poolSize), opts.Logger.With("component", "mtproto-pool", "bot", opts.Index), mws...)
+
 			opts.Logger.Info("mtproto bot ready",
 				"index", opts.Index,
 				"channel_id", opts.ChannelID,
-				"access_hash", ch.AccessHash)
+				"access_hash", ch.AccessHash,
+				"pool_size", poolSize)
 			readyOnce.Do(func() { ready <- nil })
 
 			// Block until the parent cancels — that keeps the

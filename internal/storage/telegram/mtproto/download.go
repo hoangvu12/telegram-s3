@@ -139,7 +139,10 @@ func (s *Storage) downloadViaBot(ctx context.Context, bot *MTProtoBot, ref stora
 // chunk size with extra zero-padded reads is a Telegram quirk we
 // would inherit from a naive impl.
 func (s *Storage) fetchRange(ctx context.Context, bot *MTProtoBot, loc *tg.InputDocumentFileLocation, offset, end int64) ([]byte, error) {
-	api := bot.API()
+	// Session, not API: range reads inside a single object GET fan out
+	// up to STREAM_CONCURRENCY in parallel, and would otherwise serialize
+	// through gotd's single default MTProto session per bot.
+	api := bot.Session(ctx)
 	alignedStart := offset - (offset % mtprotoDownloadChunk)
 
 	var buf bytes.Buffer
@@ -207,7 +210,10 @@ func (s *Storage) resolveLocation(ctx context.Context, bot *MTProtoBot, messageI
 }
 
 func (s *Storage) fetchLocation(ctx context.Context, bot *MTProtoBot, messageID int64) (*tg.InputDocumentFileLocation, error) {
-	api := bot.API()
+	// Session over API: a cold cache fans N concurrent location
+	// lookups (one per distinct chunk in the prefetch window) and
+	// benefits from the same per-bot multiplexing as fetchRange.
+	api := bot.Session(ctx)
 	ch := bot.Channel()
 	res, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 		Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash},

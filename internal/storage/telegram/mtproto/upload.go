@@ -67,7 +67,11 @@ func (s *Storage) Upload(ctx context.Context, name, contentType string, body io.
 // for the read path (it'd look usable but the bot transport rejects
 // "no file_id" rows, and the mtproto transport ignores file_id).
 func (s *Storage) uploadChunk(ctx context.Context, bot *MTProtoBot, name, contentType string, seq int, data []byte, total int64) (storage.Chunk, error) {
-	api := bot.API()
+	// Session, not API: uploader.WithThreads fans `s.uploadThreads`
+	// concurrent saveFilePart calls that would otherwise serialize
+	// through gotd's one default session per bot. sendMedia on the
+	// same session is fine — it's a single follow-up RPC.
+	api := bot.Session(ctx)
 
 	u := uploader.NewUploader(api).WithThreads(s.uploadThreads).WithPartSize(uploadPartSize)
 	inputFile, err := u.Upload(ctx, uploader.NewUpload(chunkFilename(name, seq), bytes.NewReader(data), total))

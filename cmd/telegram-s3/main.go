@@ -191,6 +191,7 @@ func startMTProtoPool(ctx context.Context, cfg config.Config, store *metadata.St
 				Sessions:  store,
 				Logger:    logger,
 				AuthDelay: time.Duration(i) * 200 * time.Millisecond,
+				PoolSize:  cfg.TelegramPoolSize,
 			})
 			bots[i] = b
 			errs[i] = err
