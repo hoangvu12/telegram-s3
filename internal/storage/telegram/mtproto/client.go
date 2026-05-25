@@ -270,6 +270,15 @@ func StartBot(ctx context.Context, opts BotOptions) (*MTProtoBot, error) {
 			}
 			bot.channel = ch
 
+			// Diagnostic: dump the bot's server-side admin rights once
+			// per boot. Pass-2 reap is hitting MESSAGE_DELETE_FORBIDDEN
+			// despite the Telegram client UI showing Delete Messages
+			// enabled — this is the ground-truth check (channels.getParticipant
+			// returns whatever AdminRights flags Telegram actually has set
+			// for the bot, bypassing any client-side display caching).
+			// One-off RPC at boot; remove once the diagnosis is in hand.
+			logBotAdminRights(ctx, api, ch, opts.Logger, opts.Index)
+
 			// Auth done — the client is past Run handshake, so
 			// Config().ThisDC is valid and the session pool can be
 			// built. Construction itself doesn't open connections
@@ -319,6 +328,53 @@ func StartBot(ctx context.Context, opts BotOptions) (*MTProtoBot, error) {
 	case <-ctx.Done():
 		bot.Close()
 		return nil, ctx.Err()
+	}
+}
+
+// logBotAdminRights queries channels.getParticipant for the bot itself
+// and emits a single INFO line with every AdminRights flag. Diagnostic
+// for the Phase 4 pass-2 MESSAGE_DELETE_FORBIDDEN incident — confirms
+// whether the bot's "Delete Messages" admin toggle is actually set on
+// the server (vs only appearing set in the client UI). Failures here
+// are non-fatal: the bot stays usable, we just lose the data point.
+func logBotAdminRights(ctx context.Context, api *tg.Client, ch *tg.InputChannel, logger *slog.Logger, index int) {
+	resp, err := api.ChannelsGetParticipant(ctx, &tg.ChannelsGetParticipantRequest{
+		Channel:     ch,
+		Participant: &tg.InputPeerSelf{},
+	})
+	if err != nil {
+		logger.Warn("bot admin rights probe failed",
+			"bot", index, "error", err)
+		return
+	}
+	switch p := resp.Participant.(type) {
+	case *tg.ChannelParticipantCreator:
+		logger.Info("bot admin rights",
+			"bot", index, "role", "creator", "rank", p.Rank)
+	case *tg.ChannelParticipantAdmin:
+		r := p.AdminRights
+		logger.Info("bot admin rights",
+			"bot", index,
+			"role", "admin",
+			"rank", p.Rank,
+			"delete_messages", r.DeleteMessages,
+			"post_messages", r.PostMessages,
+			"edit_messages", r.EditMessages,
+			"change_info", r.ChangeInfo,
+			"ban_users", r.BanUsers,
+			"invite_users", r.InviteUsers,
+			"pin_messages", r.PinMessages,
+			"add_admins", r.AddAdmins,
+			"anonymous", r.Anonymous,
+			"manage_call", r.ManageCall,
+			"other", r.Other,
+			"manage_topics", r.ManageTopics,
+			"post_stories", r.PostStories,
+			"edit_stories", r.EditStories,
+			"delete_stories", r.DeleteStories)
+	default:
+		logger.Warn("bot admin rights unexpected participant type",
+			"bot", index, "concrete", fmt.Sprintf("%T", p))
 	}
 }
 
