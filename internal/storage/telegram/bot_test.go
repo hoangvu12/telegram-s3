@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"telegram-s3/internal/cache"
 )
 
 // fakeTelegram mocks the Bot API endpoints bot.go uses.
@@ -28,6 +30,10 @@ type fakeTelegram struct {
 	floodN   int  // answer the next floodN calls with HTTP 429 (flood control)
 	floodRA  int  // retry_after seconds to advertise in the 429 (0 => omit hint)
 	permFail bool // answer every call with a permanent HTTP 400 (not retryable)
+	// Phase 1 instrumentation:
+	getFileCalls int  // count of /getFile resolves
+	fileGetCalls int  // count of /file/... CDN reads
+	cdn404Next   int  // answer the next N CDN GETs with 404 (path-stale simulation)
 }
 
 func newFakeTelegram() *fakeTelegram {
@@ -79,14 +85,22 @@ func (f *fakeTelegram) server(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/botTOKEN/getFile", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		fileID := r.FormValue("file_id")
+		f.mu.Lock()
+		f.getFileCalls++
+		f.mu.Unlock()
 		fmt.Fprintf(w, `{"ok":true,"result":{"file_path":%q}}`, "stored/"+fileID)
 	})
 	mux.HandleFunc("/file/botTOKEN/stored/", func(w http.ResponseWriter, r *http.Request) {
 		fileID := strings.TrimPrefix(r.URL.Path, "/file/botTOKEN/stored/")
 		f.mu.Lock()
+		f.fileGetCalls++
+		drop404 := f.cdn404Next > 0
+		if drop404 {
+			f.cdn404Next--
+		}
 		data, ok := f.files[fileID]
 		f.mu.Unlock()
-		if !ok {
+		if drop404 || !ok {
 			http.NotFound(w, r)
 			return
 		}
@@ -302,5 +316,128 @@ func TestUploadExactMultipleOfChunkSize(t *testing.T) {
 	}
 	if len(chunks) != 2 || chunks[0].Size != 8 || chunks[1].Size != 8 {
 		t.Fatalf("16 bytes / 8 = %+v, want two 8-byte chunks (no trailing empty message)", chunks)
+	}
+}
+
+// newTestBotWithCache wires the Phase 1 file_path cache into a test
+// BotStorage. The default-NewBotStorage path uses nil pathCache, so the
+// existing tests still exercise the no-cache fallback.
+func newTestBotWithCache(t *testing.T, f *fakeTelegram, chunkSize int, c *cache.Cache[string, string]) *BotStorage {
+	srv := f.server(t)
+	b := NewBotStorageWithOptions("TOKEN", "chat123", srv.URL, 0, 0, c, nil)
+	b.chunkSize = chunkSize
+	return b
+}
+
+// TestDownloadCachesFilePath: with the path cache wired, repeated
+// DownloadRange calls for the same file_id must call getFile exactly once.
+// Without the cache, this would be N round-trips per chunk read.
+func TestDownloadCachesFilePath(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeTelegram()
+	pc := cache.New[string, string](time.Minute, 0)
+	defer pc.Close()
+	b := newTestBotWithCache(t, f, 8, pc)
+
+	chunks, err := b.Upload(ctx, "obj", "application/octet-stream",
+		bytes.NewReader([]byte("hello world")))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("want 2 chunks, got %d", len(chunks))
+	}
+
+	const reads = 5
+	for i := 0; i < reads; i++ {
+		rc, err := b.DownloadRange(ctx, chunks[0].FileID, 0, 0)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		io.Copy(io.Discard, rc)
+		rc.Close()
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getFileCalls != 1 {
+		t.Fatalf("getFile called %d times across %d reads; want 1", f.getFileCalls, reads)
+	}
+	if f.fileGetCalls != reads {
+		t.Fatalf("file CDN reads = %d; want %d", f.fileGetCalls, reads)
+	}
+}
+
+// TestDownloadInvalidatesOnCDN404: a cached file_path that has expired on
+// Telegram's side returns 404 from the file CDN. We must invalidate the
+// cache entry, re-resolve via getFile, and retry once.
+func TestDownloadInvalidatesOnCDN404(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeTelegram()
+	pc := cache.New[string, string](time.Minute, 0)
+	defer pc.Close()
+	b := newTestBotWithCache(t, f, 8, pc)
+
+	chunks, err := b.Upload(ctx, "obj", "application/octet-stream",
+		bytes.NewReader([]byte("hello")))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	// Warm the cache so a stale path exists to invalidate.
+	rc, err := b.DownloadRange(ctx, chunks[0].FileID, 0, 0)
+	if err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	rc.Close()
+
+	// Next CDN read 404s once. The retry through getFile should succeed.
+	f.mu.Lock()
+	f.cdn404Next = 1
+	gfBefore := f.getFileCalls
+	f.mu.Unlock()
+
+	rc, err = b.DownloadRange(ctx, chunks[0].FileID, 0, 0)
+	if err != nil {
+		t.Fatalf("expected one-shot retry to succeed, got: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, []byte("hello")) {
+		t.Fatalf("retry returned %q, want %q", got, "hello")
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if delta := f.getFileCalls - gfBefore; delta != 1 {
+		t.Fatalf("expected exactly 1 re-resolve, got %d", delta)
+	}
+}
+
+// TestDownloadNoCache exercises the nil-cache path (the bare NewBotStorage
+// constructor). Repeated reads should each call getFile — the no-cache
+// behavior must remain unchanged from Phase 0.
+func TestDownloadNoCache(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeTelegram()
+	b := newTestBot(t, f, 8)
+
+	chunks, err := b.Upload(ctx, "obj", "application/octet-stream", bytes.NewReader([]byte("hi")))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	const reads = 3
+	for i := 0; i < reads; i++ {
+		rc, err := b.Download(ctx, chunks[0].FileID)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		io.Copy(io.Discard, rc)
+		rc.Close()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getFileCalls != reads {
+		t.Fatalf("no-cache getFile calls = %d, want %d", f.getFileCalls, reads)
 	}
 }

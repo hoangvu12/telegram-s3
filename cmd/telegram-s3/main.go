@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"telegram-s3/internal/cache"
 	"telegram-s3/internal/config"
 	"telegram-s3/internal/metadata"
 	"telegram-s3/internal/s3api"
@@ -31,7 +32,21 @@ func main() {
 	}
 	defer store.Close()
 
-	backend := telegram.NewBotStorageWithOptions(cfg.TelegramBotToken, cfg.TelegramChatID, cfg.TelegramAPIBaseURL, cfg.HTTPMaxIdleConnsPerHost, logger)
+	// Bot API file_path cache: getFile becomes a per-fileID one-shot
+	// instead of per-chunk-read. The cache is reusable by shape in Phase 4
+	// (different K/V); the type lives in internal/cache.
+	pathCache := cache.New[string, string](cfg.LocationCacheTTL, 0)
+	defer pathCache.Close()
+
+	backend := telegram.NewBotStorageWithOptions(
+		cfg.TelegramBotToken,
+		cfg.TelegramChatID,
+		cfg.TelegramAPIBaseURL,
+		cfg.HTTPMaxIdleConnsPerHost,
+		int(cfg.TelegramMaxChunkSize),
+		pathCache,
+		logger,
+	)
 	handler := s3api.NewHandler(cfg, store, backend, logger)
 
 	// Abandoned-multipart janitor (P8.6). Skipped if the sweep is disabled

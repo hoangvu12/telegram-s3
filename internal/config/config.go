@@ -2,8 +2,10 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -35,6 +37,15 @@ type Config struct {
 	// concurrent readers and one writer; we open a separate single-conn
 	// writer pool, so this knob only governs the SELECT side.
 	SQLiteReaderConns int
+	// LocationCacheTTL is how long a resolved Bot API file_path is cached
+	// under its file_id. Telegram's docs say a file_path is valid for at
+	// least an hour; 30m is a safe default that survives the longest reads
+	// we issue (range fetches over chunked objects). Phase 1.
+	LocationCacheTTL time.Duration
+	// TelegramMaxChunkSize is the upload chunk window. 18 MiB stays under
+	// the public Bot API 20 MB getFile cap; users running a self-hosted
+	// `tdlib/telegram-bot-api` server can raise this to ~1.9 GiB. Phase 1.
+	TelegramMaxChunkSize int64
 }
 
 func Load() (Config, error) {
@@ -52,6 +63,8 @@ func Load() (Config, error) {
 		MultipartSweepInterval:  getDuration("MULTIPART_SWEEP_INTERVAL", time.Hour),
 		HTTPMaxIdleConnsPerHost: getInt("HTTP_MAX_IDLE_CONNS_PER_HOST", 32),
 		SQLiteReaderConns:       getInt("SQLITE_READER_CONNS", 8),
+		LocationCacheTTL:        getDuration("LOCATION_CACHE_TTL", 30*time.Minute),
+		TelegramMaxChunkSize:    getBytes("TELEGRAM_MAX_CHUNK_SIZE", 18<<20),
 	}
 
 	if cfg.AccessKeyID == "" {
@@ -93,4 +106,54 @@ func getInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// getBytes parses a byte-count env var. Accepts plain integers ("1900000000")
+// and common suffixes (KB/MB/GB decimal, KiB/MiB/GiB binary). Invalid values
+// silently fall back; we keep go-humanize an indirect dep rather than promote
+// it just for this.
+func getBytes(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	if n, err := parseBytes(value); err == nil && n > 0 {
+		return n
+	}
+	return fallback
+}
+
+func parseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	// Split numeric prefix from unit suffix.
+	i := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	numStr := s[:i]
+	unit := strings.TrimSpace(strings.ToLower(s[i:]))
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, err
+	}
+	var mult float64 = 1
+	switch unit {
+	case "", "b":
+		mult = 1
+	case "k", "kb":
+		mult = 1000
+	case "m", "mb":
+		mult = 1000 * 1000
+	case "g", "gb":
+		mult = 1000 * 1000 * 1000
+	case "kib":
+		mult = 1024
+	case "mib":
+		mult = 1024 * 1024
+	case "gib":
+		mult = 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("unrecognized byte unit %q", unit)
+	}
+	return int64(num * mult), nil
 }

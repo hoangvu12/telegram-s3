@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"telegram-s3/internal/cache"
 	"telegram-s3/internal/storage"
 )
 
@@ -32,23 +33,31 @@ type BotStorage struct {
 	chunkSize int // == MaxChunkSize in production; overridable in tests
 	client    *http.Client
 	logger    *slog.Logger
+	// pathCache memoizes file_id → file_path so range reads of a chunked
+	// object stop paying a getFile round-trip per chunk. Nil disables
+	// caching (the bare NewBotStorage constructor). Phase 1.
+	pathCache *cache.Cache[string, string]
 }
 
 func NewBotStorage(token, chatID, baseURL string, logger *slog.Logger) *BotStorage {
-	return NewBotStorageWithOptions(token, chatID, baseURL, 0, logger)
+	return NewBotStorageWithOptions(token, chatID, baseURL, 0, 0, nil, logger)
 }
 
 // NewBotStorageWithOptions lets callers tune the keepalive pool size used for
-// concurrent chunk requests. Go's default MaxIdleConnsPerHost is 2, which
-// silently throttles fan-out: every extra chunk pays a TLS handshake. A pool
-// of 32 is enough for Phase 2's prefetch reader without being unbounded.
-// idlePerHost <= 0 falls back to a built-in default.
-func NewBotStorageWithOptions(token, chatID, baseURL string, idlePerHost int, logger *slog.Logger) *BotStorage {
+// concurrent chunk requests, the upload chunk window, and the file_path
+// cache. Go's default MaxIdleConnsPerHost is 2, which silently throttles
+// fan-out: every extra chunk pays a TLS handshake. A pool of 32 is enough
+// for Phase 2's prefetch reader without being unbounded. maxChunkSize and
+// pathCache <= 0 / nil fall back to defaults (MaxChunkSize, no cache).
+func NewBotStorageWithOptions(token, chatID, baseURL string, idlePerHost, maxChunkSize int, pathCache *cache.Cache[string, string], logger *slog.Logger) *BotStorage {
 	if baseURL == "" {
 		baseURL = "https://api.telegram.org"
 	}
 	if idlePerHost <= 0 {
 		idlePerHost = 32
+	}
+	if maxChunkSize <= 0 {
+		maxChunkSize = MaxChunkSize
 	}
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -69,12 +78,13 @@ func NewBotStorageWithOptions(token, chatID, baseURL string, idlePerHost int, lo
 		token:     token,
 		chatID:    chatID,
 		baseURL:   strings.TrimRight(baseURL, "/"),
-		chunkSize: MaxChunkSize,
+		chunkSize: maxChunkSize,
 		// No client-wide Timeout: a chunk transfer can legitimately take
 		// minutes for large objects. Per-request cancellation flows through
 		// the request context (handler ctx → http.NewRequestWithContext).
-		client: &http.Client{Transport: transport, Timeout: 0},
-		logger: logger,
+		client:    &http.Client{Transport: transport, Timeout: 0},
+		logger:    logger,
+		pathCache: pathCache,
 	}
 }
 
@@ -245,32 +255,67 @@ func (b *BotStorage) Download(ctx context.Context, fileID string) (io.ReadCloser
 	return b.DownloadRange(ctx, fileID, 0, 0)
 }
 
+// errFilePathGone is returned by fetchFile when the file CDN responds 404.
+// It signals "the cached file_path is stale" so DownloadRange knows to
+// invalidate and re-resolve. Any other download error is non-recoverable
+// without help from the caller.
+var errFilePathGone = errors.New("telegram file path returned 404")
+
 // DownloadRange resolves fileID via getFile then fetches the file, optionally
 // requesting only [offset, offset+length). Telegram's file CDN honors HTTP
-// Range, which Phase 5 (Range GET) relies on.
+// Range, which Phase 5 (Range GET) relies on. When pathCache is set the
+// resolved file_path is reused across calls; a 404 on the file GET means
+// the cached path expired, so we invalidate and resolve once more.
 func (b *BotStorage) DownloadRange(ctx context.Context, fileID string, offset, length int64) (io.ReadCloser, error) {
+	if b.pathCache != nil {
+		if path, ok := b.pathCache.Get(fileID); ok {
+			rc, err := b.fetchFile(ctx, path, offset, length)
+			if err == nil {
+				return rc, nil
+			}
+			if !errors.Is(err, errFilePathGone) {
+				return nil, err
+			}
+			// Cached path is stale. Drop it and fall through to re-resolve.
+			b.pathCache.Delete(fileID)
+		}
+	}
+	path, err := b.resolveFilePath(ctx, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if b.pathCache != nil {
+		b.pathCache.Set(fileID, path, 0)
+	}
+	return b.fetchFile(ctx, path, offset, length)
+}
+
+func (b *BotStorage) resolveFilePath(ctx context.Context, fileID string) (string, error) {
 	reqBody := strings.NewReader("file_id=" + url.QueryEscape(fileID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL("getFile"), reqBody)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	var result getFileResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return "", err
 	}
 	if resp.StatusCode >= 300 || !result.OK {
-		return nil, fmt.Errorf("telegram getFile failed: %s", result.Description)
+		return "", fmt.Errorf("telegram getFile failed: %s", result.Description)
 	}
+	return result.Result.FilePath, nil
+}
 
-	downloadReq, err := http.NewRequestWithContext(ctx, http.MethodGet, b.fileURL(result.Result.FilePath), nil)
+func (b *BotStorage) fetchFile(ctx context.Context, filePath string, offset, length int64) (io.ReadCloser, error) {
+	downloadReq, err := http.NewRequestWithContext(ctx, http.MethodGet, b.fileURL(filePath), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +329,10 @@ func (b *BotStorage) DownloadRange(ctx context.Context, fileID string, offset, l
 	downloadResp, err := b.client.Do(downloadReq)
 	if err != nil {
 		return nil, err
+	}
+	if downloadResp.StatusCode == http.StatusNotFound {
+		downloadResp.Body.Close()
+		return nil, errFilePathGone
 	}
 	if downloadResp.StatusCode >= 300 {
 		downloadResp.Body.Close()
