@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -51,12 +52,11 @@ type Object struct {
 // Chunk mirrors storage.Chunk for persistence (the layers stay decoupled; the
 // handler converts between them, as it already does for Object).
 //
-// Transport and BotIndex are present in-memory in Phase 2 to keep the
-// metadata <-> storage conversion lossless, but the SQLite schema does NOT
-// yet have columns for them — every Get* method leaves both at the zero
-// value. Phase 3 adds the columns + a backfill so chunked rows persist
-// (Transport="bot", BotIndex=0). The dispatcher treats Transport == ""
-// as "bot" so a pre-Phase-3 row routes through BotStorage unchanged.
+// Transport and BotIndex are persisted on the chunk row (Phase 3 schema
+// additions). Pre-Phase-3 rows backfilled at migration time read as
+// Transport="bot", BotIndex=0. The dispatcher treats Transport == "" as
+// "bot" so the absent-column case (e.g. a fresh test DB hand-rolled
+// without the column) still routes through BotStorage.
 type Chunk struct {
 	Seq       int
 	FileID    string
@@ -119,7 +119,7 @@ func (s *Store) Close() error {
 func (s *Store) migrate() error {
 	// Additive only: the existing buckets/objects schema is untouched so live
 	// production rows (legacy single-message objects) keep working.
-	_, err := s.write.Exec(`
+	if _, err := s.write.Exec(`
 CREATE TABLE IF NOT EXISTS buckets (
   name TEXT PRIMARY KEY,
   created_at TEXT NOT NULL
@@ -195,8 +195,121 @@ CREATE TABLE IF NOT EXISTS multipart_upload_metadata (
   value TEXT NOT NULL,
   PRIMARY KEY (upload_id, name)
 );
-`)
+`); err != nil {
+		return err
+	}
+
+	// Phase 3 additive columns. SQLite doesn't support `ADD COLUMN IF NOT
+	// EXISTS`, so ensureColumn probes pragma_table_info first and only
+	// issues the ALTER when missing. NOT NULL DEFAULT is safe with ALTER
+	// TABLE since SQLite materializes the default for existing rows.
+	for _, c := range []struct {
+		table, col, typ, def string
+	}{
+		{"object_chunks", "transport", "TEXT NOT NULL", "'bot'"},
+		{"object_chunks", "bot_index", "INTEGER NOT NULL", "0"},
+		{"multipart_part_chunks", "transport", "TEXT NOT NULL", "'bot'"},
+		{"multipart_part_chunks", "bot_index", "INTEGER NOT NULL", "0"},
+		{"objects", "transport", "TEXT NOT NULL", "'bot'"},
+		{"objects", "bot_index", "INTEGER NOT NULL", "0"},
+	} {
+		if err := s.ensureColumn(c.table, c.col, c.typ, c.def); err != nil {
+			return err
+		}
+	}
+
+	// One-shot backfill: legacy single-message objects (size > 0, no row in
+	// object_chunks) collapse to a one-row chunk so every read path can
+	// consume object_chunks uniformly — the three pre-Phase-3 fallback
+	// branches in handler.go are deleted in this phase. Idempotent: the
+	// EXISTS clause skips already-backfilled rows on subsequent boots.
+	return s.backfillLegacyChunks()
+}
+
+// ensureColumn issues ALTER TABLE ADD COLUMN if the column is missing.
+// SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe pragma_table_info
+// first; the helper is the single place ALTER lives so future additive
+// migrations follow the same pattern.
+func (s *Store) ensureColumn(table, col, typ, defaultExpr string) error {
+	rows, err := s.write.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Identifiers come from the caller (this file), not user input — so the
+	// fmt.Sprintf is safe. SQL injection would require attacker control of
+	// `table`/`col`, which is impossible.
+	stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s DEFAULT %s`, table, col, typ, defaultExpr)
+	_, err = s.write.Exec(stmt)
 	return err
+}
+
+// backfillLegacyChunks turns every pre-Phase-3 single-message object into
+// a one-row object_chunks entry so the read/delete code paths can drop
+// their legacy fallbacks. Empty objects (size == 0) never had a Telegram
+// message and stay chunkless. Re-running is a no-op: the NOT EXISTS clause
+// filters out rows that already have chunks (the normal Phase-2+ shape).
+func (s *Store) backfillLegacyChunks() error {
+	tx, err := s.write.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`
+SELECT bucket, key, size, telegram_file_id, telegram_message_id
+FROM objects
+WHERE size > 0
+  AND telegram_message_id != 0
+  AND deleted_at IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM object_chunks oc
+    WHERE oc.bucket = objects.bucket AND oc.key = objects.key
+  )
+`)
+	if err != nil {
+		return err
+	}
+	type legacyRow struct {
+		bucket, key, fileID string
+		size, messageID     int64
+	}
+	var legacies []legacyRow
+	for rows.Next() {
+		var r legacyRow
+		if err := rows.Scan(&r.bucket, &r.key, &r.size, &r.fileID, &r.messageID); err != nil {
+			rows.Close()
+			return err
+		}
+		legacies = append(legacies, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, r := range legacies {
+		if _, err := tx.Exec(`
+INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index)
+VALUES(?, ?, 0, ?, ?, ?, 0, 'bot', 0)
+`, r.bucket, r.key, r.fileID, r.messageID, r.size); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
@@ -280,10 +393,14 @@ ON CONFLICT(bucket, key) DO UPDATE SET
 		return err
 	}
 	for _, c := range chunks {
+		transport := c.Transport
+		if transport == "" {
+			transport = "bot"
+		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset)
-VALUES(?, ?, ?, ?, ?, ?, ?)
-`, obj.Bucket, obj.Key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset); err != nil {
+INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, obj.Bucket, obj.Key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset, transport, c.BotIndex); err != nil {
 			return err
 		}
 	}
@@ -347,11 +464,12 @@ WHERE bucket = ? AND key = ? AND deleted_at IS NULL
 	return obj, nil
 }
 
-// GetObjectChunks returns the ordered chunk map, or an empty slice for legacy
-// single-message objects (which predate Phase 3 and use Object.TelegramFileID).
+// GetObjectChunks returns the ordered chunk map. Post-Phase-3 every
+// non-empty object has at least one row here (legacy single-message
+// objects are backfilled at migration time); empty objects return nil.
 func (s *Store) GetObjectChunks(ctx context.Context, bucket, key string) ([]Chunk, error) {
 	rows, err := s.read.QueryContext(ctx, `
-SELECT part_seq, telegram_file_id, telegram_message_id, size, offset
+SELECT part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index
 FROM object_chunks
 WHERE bucket = ? AND key = ?
 ORDER BY part_seq
@@ -364,7 +482,7 @@ ORDER BY part_seq
 	var chunks []Chunk
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.Seq, &c.FileID, &c.MessageID, &c.Size, &c.Offset); err != nil {
+		if err := rows.Scan(&c.Seq, &c.FileID, &c.MessageID, &c.Size, &c.Offset, &c.Transport, &c.BotIndex); err != nil {
 			return nil, err
 		}
 		chunks = append(chunks, c)
@@ -602,7 +720,7 @@ func (s *Store) StaleMultipartUploads(ctx context.Context, before time.Time) ([]
 }
 
 func (s *Store) GetMultipartPartChunks(ctx context.Context, uploadID string, partNumber int) ([]Chunk, error) {
-	rows, err := s.read.QueryContext(ctx, `SELECT seq, telegram_file_id, telegram_message_id, size FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
+	rows, err := s.read.QueryContext(ctx, `SELECT seq, telegram_file_id, telegram_message_id, size, transport, bot_index FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +728,7 @@ func (s *Store) GetMultipartPartChunks(ctx context.Context, uploadID string, par
 	var chunks []Chunk
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.Seq, &c.FileID, &c.MessageID, &c.Size); err != nil {
+		if err := rows.Scan(&c.Seq, &c.FileID, &c.MessageID, &c.Size, &c.Transport, &c.BotIndex); err != nil {
 			return nil, err
 		}
 		chunks = append(chunks, c)
@@ -636,8 +754,12 @@ ON CONFLICT(upload_id, part_number) DO UPDATE SET etag = excluded.etag, size = e
 		return err
 	}
 	for _, c := range chunks {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO multipart_part_chunks(upload_id, part_number, seq, telegram_file_id, telegram_message_id, size) VALUES(?, ?, ?, ?, ?, ?)`,
-			uploadID, partNumber, c.Seq, c.FileID, c.MessageID, c.Size); err != nil {
+		transport := c.Transport
+		if transport == "" {
+			transport = "bot"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO multipart_part_chunks(upload_id, part_number, seq, telegram_file_id, telegram_message_id, size, transport, bot_index) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+			uploadID, partNumber, c.Seq, c.FileID, c.MessageID, c.Size, transport, c.BotIndex); err != nil {
 			return err
 		}
 	}
@@ -662,8 +784,11 @@ func (s *Store) ListMultipartParts(ctx context.Context, uploadID string) ([]Mult
 }
 
 // AllMultipartChunks returns every chunk across all parts (for abort cleanup).
+// Transport and BotIndex are included so the dispatcher routes each delete
+// to the bot that owns the message — under Bot HTTP API a message can only
+// be deleted by the bot that sent it (modulo channel-admin permissions).
 func (s *Store) AllMultipartChunks(ctx context.Context, uploadID string) ([]Chunk, error) {
-	rows, err := s.read.QueryContext(ctx, `SELECT telegram_file_id, telegram_message_id FROM multipart_part_chunks WHERE upload_id = ? ORDER BY part_number, seq`, uploadID)
+	rows, err := s.read.QueryContext(ctx, `SELECT telegram_file_id, telegram_message_id, transport, bot_index FROM multipart_part_chunks WHERE upload_id = ? ORDER BY part_number, seq`, uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +796,7 @@ func (s *Store) AllMultipartChunks(ctx context.Context, uploadID string) ([]Chun
 	var chunks []Chunk
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.FileID, &c.MessageID); err != nil {
+		if err := rows.Scan(&c.FileID, &c.MessageID, &c.Transport, &c.BotIndex); err != nil {
 			return nil, err
 		}
 		chunks = append(chunks, c)
@@ -708,8 +833,12 @@ ON CONFLICT(bucket, key) DO UPDATE SET
 		return err
 	}
 	for _, c := range chunks {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-			obj.Bucket, obj.Key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset); err != nil {
+		transport := c.Transport
+		if transport == "" {
+			transport = "bot"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			obj.Bucket, obj.Key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset, transport, c.BotIndex); err != nil {
 			return err
 		}
 	}

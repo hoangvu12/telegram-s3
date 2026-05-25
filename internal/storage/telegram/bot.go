@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -26,12 +25,17 @@ import (
 // is a safe default that works on the public API unchanged.
 const MaxChunkSize = 18 << 20
 
+// BotStorage is the Bot HTTP API backend. It holds a pool of bot tokens
+// (Phase 3) — Upload picks a fresh bot per chunk so the round-robin spreads
+// load across the pool, and the chosen index is persisted in
+// object_chunks.bot_index so the same bot resolves the chunk on read. The
+// pool's two counters (stream/upload) are independent so a burst of one op
+// doesn't skew the other (teldrive's model).
 type BotStorage struct {
-	token     string
+	pool      *BotPool
 	chatID    string
 	baseURL   string
 	chunkSize int // == MaxChunkSize in production; overridable in tests
-	client    *http.Client
 	logger    *slog.Logger
 	// pathCache memoizes file_id → file_path so range reads of a chunked
 	// object stop paying a getFile round-trip per chunk. Nil disables
@@ -39,65 +43,55 @@ type BotStorage struct {
 	pathCache *cache.Cache[string, string]
 }
 
+// NewBotStorage is the single-token convenience constructor used by tests.
+// Production code goes through NewBotStorageWithOptions with the full token
+// list pulled from TELEGRAM_BOT_TOKENS.
 func NewBotStorage(token, chatID, baseURL string, logger *slog.Logger) *BotStorage {
-	return NewBotStorageWithOptions(token, chatID, baseURL, 0, 0, nil, logger)
+	return NewBotStorageWithOptions([]string{token}, chatID, baseURL, 0, 0, nil, logger)
 }
 
-// NewBotStorageWithOptions lets callers tune the keepalive pool size used for
-// concurrent chunk requests, the upload chunk window, and the file_path
-// cache. Go's default MaxIdleConnsPerHost is 2, which silently throttles
-// fan-out: every extra chunk pays a TLS handshake. A pool of 32 is enough
-// for Phase 2's prefetch reader without being unbounded. maxChunkSize and
-// pathCache <= 0 / nil fall back to defaults (MaxChunkSize, no cache).
-func NewBotStorageWithOptions(token, chatID, baseURL string, idlePerHost, maxChunkSize int, pathCache *cache.Cache[string, string], logger *slog.Logger) *BotStorage {
+// NewBotStorageWithOptions builds the pool from the given token list and
+// tunes the keepalive pool, the upload chunk window, and the file_path
+// cache. tokens must be non-empty (the config layer validates that). Each
+// bot in the pool gets its own *http.Client so the keepalive pool is sized
+// per-token. maxChunkSize and pathCache <= 0 / nil fall back to defaults
+// (MaxChunkSize, no cache).
+func NewBotStorageWithOptions(tokens []string, chatID, baseURL string, idlePerHost, maxChunkSize int, pathCache *cache.Cache[string, string], logger *slog.Logger) *BotStorage {
 	if baseURL == "" {
 		baseURL = "https://api.telegram.org"
-	}
-	if idlePerHost <= 0 {
-		idlePerHost = 32
 	}
 	if maxChunkSize <= 0 {
 		maxChunkSize = MaxChunkSize
 	}
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          idlePerHost * 4,
-		MaxIdleConnsPerHost:   idlePerHost,
-		MaxConnsPerHost:       idlePerHost,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+	if len(tokens) == 0 {
+		// Defensive: a zero-bot pool would panic on Pick. The config layer
+		// already rejects this, so reaching here means a programming bug;
+		// substitute one empty token so failures surface as auth errors
+		// rather than a runtime panic during Upload.
+		tokens = []string{""}
 	}
 	return &BotStorage{
-		token:     token,
+		pool:      NewBotPool(tokens, idlePerHost),
 		chatID:    chatID,
 		baseURL:   strings.TrimRight(baseURL, "/"),
 		chunkSize: maxChunkSize,
-		// No client-wide Timeout: a chunk transfer can legitimately take
-		// minutes for large objects. Per-request cancellation flows through
-		// the request context (handler ctx → http.NewRequestWithContext).
-		client:    &http.Client{Transport: transport, Timeout: 0},
 		logger:    logger,
 		pathCache: pathCache,
 	}
 }
 
 // Upload reads body in chunkSize windows, sending each as its own Telegram
-// document, and returns the ordered chunk list. Peak memory is one chunk and
-// grows only to the chunk's *actual* size: a 1-byte object costs a few bytes,
-// not chunkSize. The previous make([]byte, chunkSize) allocated 18 MiB per
-// call regardless of payload size, so ~10 concurrent small PUTs (the aws-cli
-// default for `s3 cp --recursive`) pinned ~180 MiB of buffers and the
-// container was OOM-killed mid-bulk-upload (the proxy then 502s). Whether the
-// body is short/truncated is the caller's concern: we store whatever bytes we
-// receive and let putObject validate the total against
-// X-Amz-Decoded-Content-Length.
+// document, and returns the ordered chunk list. A fresh bot is picked per
+// chunk so a single object's bytes spread across the pool; each chunk's
+// BotIndex is persisted so reads target the same bot.
+//
+// Peak memory is one chunk and grows only to the chunk's *actual* size: a
+// 1-byte object costs a few bytes, not chunkSize. The previous
+// make([]byte, chunkSize) allocated 18 MiB per call regardless of payload
+// size, so ~10 concurrent small PUTs pinned ~180 MiB of buffers and the
+// container was OOM-killed mid-bulk-upload. Whether the body is short /
+// truncated is the caller's concern: we store whatever bytes we receive
+// and let putObject validate the total against X-Amz-Decoded-Content-Length.
 func (b *BotStorage) Upload(ctx context.Context, name, contentType string, body io.Reader) ([]storage.Chunk, error) {
 	var chunks []storage.Chunk
 	var offset int64
@@ -110,7 +104,8 @@ func (b *BotStorage) Upload(ctx context.Context, name, contentType string, body 
 		// (n < chunkSize) means the body is exhausted.
 		n, rerr := io.CopyBuffer(&chunk, io.LimitReader(body, int64(b.chunkSize)), scratch)
 		if n > 0 {
-			ch, err := b.sendChunk(ctx, name, contentType, seq, chunk.Bytes())
+			botIdx, bot := b.pool.Pick(BotOpUpload)
+			ch, err := b.sendChunk(ctx, bot, name, contentType, seq, chunk.Bytes())
 			if err != nil {
 				b.cleanup(ctx, chunks)
 				return nil, err
@@ -118,6 +113,7 @@ func (b *BotStorage) Upload(ctx context.Context, name, contentType string, body 
 			ch.Seq = seq
 			ch.Size = n
 			ch.Offset = offset
+			ch.BotIndex = botIdx
 			chunks = append(chunks, ch)
 			offset += n
 		}
@@ -134,8 +130,12 @@ func (b *BotStorage) Upload(ctx context.Context, name, contentType string, body 
 
 func (b *BotStorage) cleanup(ctx context.Context, chunks []storage.Chunk) {
 	for _, c := range chunks {
-		if err := b.deleteMessage(ctx, c.MessageID); err != nil && b.logger != nil {
-			b.logger.Warn("cleanup orphaned chunk failed", "message_id", c.MessageID, "error", err)
+		_, bot := b.pool.At(c.BotIndex)
+		if bot == nil {
+			continue // out-of-range index; nothing we can do here
+		}
+		if err := b.deleteMessage(ctx, bot, c.MessageID); err != nil && b.logger != nil {
+			b.logger.Warn("cleanup orphaned chunk failed", "message_id", c.MessageID, "bot_index", c.BotIndex, "error", err)
 		}
 	}
 }
@@ -157,11 +157,11 @@ func (e *errRetryable) Unwrap() error { return e.err }
 // data is already in memory, so each attempt simply rebuilds the multipart
 // body. Bounded attempts + ctx cancellation keep a wedged backend from
 // hanging the request forever.
-func (b *BotStorage) sendChunk(ctx context.Context, name, contentType string, seq int, data []byte) (storage.Chunk, error) {
+func (b *BotStorage) sendChunk(ctx context.Context, bot *botClient, name, contentType string, seq int, data []byte) (storage.Chunk, error) {
 	const maxAttempts = 5
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		ch, err := b.sendChunkOnce(ctx, name, contentType, seq, data)
+		ch, err := b.sendChunkOnce(ctx, bot, name, contentType, seq, data)
 		if err == nil {
 			return ch, nil
 		}
@@ -191,7 +191,7 @@ func (b *BotStorage) sendChunk(ctx context.Context, name, contentType string, se
 // sendChunkOnce streams data (already in memory) as a multipart sendDocument
 // via an io.Pipe, so the request body is not copied into a second buffer. A
 // transient failure is returned wrapped in *errRetryable.
-func (b *BotStorage) sendChunkOnce(ctx context.Context, name, contentType string, seq int, data []byte) (storage.Chunk, error) {
+func (b *BotStorage) sendChunkOnce(ctx context.Context, bot *botClient, name, contentType string, seq int, data []byte) (storage.Chunk, error) {
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
@@ -211,13 +211,13 @@ func (b *BotStorage) sendChunkOnce(ctx context.Context, name, contentType string
 		werr = mw.Close()
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL("sendDocument"), pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL(bot.token, "sendDocument"), pr)
 	if err != nil {
 		return storage.Chunk{}, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	resp, err := b.client.Do(req)
+	resp, err := bot.client.Do(req)
 	if err != nil {
 		// Transport-level failure (connection reset, timeout): worth a retry.
 		return storage.Chunk{}, &errRetryable{err: err}
@@ -267,13 +267,21 @@ var errFilePathGone = errors.New("telegram file path returned 404")
 // resolved file_path is reused across calls; a 404 on the file GET means
 // the cached path expired, so we invalidate and resolve once more.
 //
-// Only ref.BotFileID is consulted under the Bot HTTP API; ref.MessageID and
-// ref.BotIndex carry through for Phase 3/4 dispatch.
+// Under the Bot HTTP API, file_id is bot-bound: only the bot that uploaded
+// the chunk can re-resolve it. ref.BotIndex selects that bot; an
+// out-of-range index returns an explicit error (a row written on a deploy
+// with a larger pool that was then shrunk). The Phase 4 MTProto backend
+// will add round-robin fallback for transient bot failures since
+// message_id under MTProto is bot-agnostic.
 func (b *BotStorage) DownloadRange(ctx context.Context, ref storage.ChunkRef, offset, length int64) (io.ReadCloser, error) {
+	_, bot := b.pool.At(ref.BotIndex)
+	if bot == nil {
+		return nil, fmt.Errorf("bot_index %d out of range (pool size %d)", ref.BotIndex, b.pool.Len())
+	}
 	fileID := ref.BotFileID
 	if b.pathCache != nil {
 		if path, ok := b.pathCache.Get(fileID); ok {
-			rc, err := b.fetchFile(ctx, path, offset, length)
+			rc, err := b.fetchFile(ctx, bot, path, offset, length)
 			if err == nil {
 				return rc, nil
 			}
@@ -284,25 +292,25 @@ func (b *BotStorage) DownloadRange(ctx context.Context, ref storage.ChunkRef, of
 			b.pathCache.Delete(fileID)
 		}
 	}
-	path, err := b.resolveFilePath(ctx, fileID)
+	path, err := b.resolveFilePath(ctx, bot, fileID)
 	if err != nil {
 		return nil, err
 	}
 	if b.pathCache != nil {
 		b.pathCache.Set(fileID, path, 0)
 	}
-	return b.fetchFile(ctx, path, offset, length)
+	return b.fetchFile(ctx, bot, path, offset, length)
 }
 
-func (b *BotStorage) resolveFilePath(ctx context.Context, fileID string) (string, error) {
+func (b *BotStorage) resolveFilePath(ctx context.Context, bot *botClient, fileID string) (string, error) {
 	reqBody := strings.NewReader("file_id=" + url.QueryEscape(fileID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL("getFile"), reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL(bot.token, "getFile"), reqBody)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := b.client.Do(req)
+	resp, err := bot.client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -318,8 +326,8 @@ func (b *BotStorage) resolveFilePath(ctx context.Context, fileID string) (string
 	return result.Result.FilePath, nil
 }
 
-func (b *BotStorage) fetchFile(ctx context.Context, filePath string, offset, length int64) (io.ReadCloser, error) {
-	downloadReq, err := http.NewRequestWithContext(ctx, http.MethodGet, b.fileURL(filePath), nil)
+func (b *BotStorage) fetchFile(ctx context.Context, bot *botClient, filePath string, offset, length int64) (io.ReadCloser, error) {
+	downloadReq, err := http.NewRequestWithContext(ctx, http.MethodGet, b.fileURL(bot.token, filePath), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +338,7 @@ func (b *BotStorage) fetchFile(ctx context.Context, filePath string, offset, len
 			downloadReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		}
 	}
-	downloadResp, err := b.client.Do(downloadReq)
+	downloadResp, err := bot.client.Do(downloadReq)
 	if err != nil {
 		return nil, err
 	}
@@ -346,22 +354,39 @@ func (b *BotStorage) fetchFile(ctx context.Context, filePath string, offset, len
 }
 
 func (b *BotStorage) Delete(ctx context.Context, ref storage.ChunkRef) error {
-	return b.deleteMessage(ctx, ref.MessageID)
+	_, bot := b.pool.At(ref.BotIndex)
+	if bot == nil {
+		return fmt.Errorf("bot_index %d out of range (pool size %d)", ref.BotIndex, b.pool.Len())
+	}
+	return b.deleteMessage(ctx, bot, ref.MessageID)
 }
 
-// DeleteBatch fan-outs Delete serially over refs. The Bot HTTP API has no
-// batched deleteMessages; Phase 4's MTProto backend will override this with
-// channels.deleteMessages at 100 refs/call. Returns the first error
-// encountered; subsequent failures are logged.
+// DeleteBatch fan-outs Delete serially over refs, routing each to the bot
+// that uploaded it (so the message-owner is the one issuing deleteMessage,
+// even though channel admins can typically delete any message). The Bot
+// HTTP API has no batched deleteMessages; Phase 4's MTProto backend will
+// override this with channels.deleteMessages at 100 refs/call. Returns the
+// first error encountered; subsequent failures are logged.
 func (b *BotStorage) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) error {
 	var firstErr error
 	for _, ref := range refs {
-		if err := b.deleteMessage(ctx, ref.MessageID); err != nil {
+		_, bot := b.pool.At(ref.BotIndex)
+		if bot == nil {
+			err := fmt.Errorf("bot_index %d out of range (pool size %d)", ref.BotIndex, b.pool.Len())
 			if firstErr == nil {
 				firstErr = err
 			}
 			if b.logger != nil {
-				b.logger.Warn("batch delete failed", "message_id", ref.MessageID, "error", err)
+				b.logger.Warn("batch delete skipped (out-of-range bot)", "message_id", ref.MessageID, "bot_index", ref.BotIndex)
+			}
+			continue
+		}
+		if err := b.deleteMessage(ctx, bot, ref.MessageID); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if b.logger != nil {
+				b.logger.Warn("batch delete failed", "message_id", ref.MessageID, "bot_index", ref.BotIndex, "error", err)
 			}
 		}
 	}
@@ -370,15 +395,15 @@ func (b *BotStorage) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) e
 
 // deleteMessage is the raw deleteMessage call shared by Delete, DeleteBatch,
 // and the upload-cleanup path (which only has message IDs in flight).
-func (b *BotStorage) deleteMessage(ctx context.Context, messageID int64) error {
+func (b *BotStorage) deleteMessage(ctx context.Context, bot *botClient, messageID int64) error {
 	form := url.Values{"chat_id": {b.chatID}, "message_id": {strconv.FormatInt(messageID, 10)}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL("deleteMessage"), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiURL(bot.token, "deleteMessage"), strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := b.client.Do(req)
+	resp, err := bot.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -394,12 +419,12 @@ func (b *BotStorage) deleteMessage(ctx context.Context, messageID int64) error {
 	return nil
 }
 
-func (b *BotStorage) apiURL(method string) string {
-	return fmt.Sprintf("%s/bot%s/%s", b.baseURL, b.token, method)
+func (b *BotStorage) apiURL(token, method string) string {
+	return fmt.Sprintf("%s/bot%s/%s", b.baseURL, token, method)
 }
 
-func (b *BotStorage) fileURL(path string) string {
-	return fmt.Sprintf("%s/file/bot%s/%s", b.baseURL, b.token, path)
+func (b *BotStorage) fileURL(token, path string) string {
+	return fmt.Sprintf("%s/file/bot%s/%s", b.baseURL, token, path)
 }
 
 func chunkFilename(name string, seq int) string {

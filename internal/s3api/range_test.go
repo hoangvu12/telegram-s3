@@ -2,14 +2,11 @@ package s3api
 
 import (
 	"bytes"
-	"context"
 	"encoding/xml"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"telegram-s3/internal/metadata"
 )
 
 // rangeData is 50 bytes (data[i] == i) so a fakeBackend with chunkSize 4 splits
@@ -201,38 +198,3 @@ func TestRangeEmptyObject(t *testing.T) {
 	}
 }
 
-// A legacy single-message object (no object_chunks rows, pre-Phase-3) must also
-// serve ranges via the backend's ranged read of Object.TelegramFileID.
-func TestRangeLegacySingleMessage(t *testing.T) {
-	r := newMPRig(t)
-	if rec := r.do(http.MethodPut, "/send", nil); rec.Code != http.StatusOK {
-		t.Fatalf("create bucket: %d", rec.Code)
-	}
-	data := rangeData()
-	r.be.mu.Lock()
-	r.be.files["legacyfid"] = append([]byte(nil), data...)
-	r.be.mu.Unlock()
-	if err := r.h.store.PutObject(context.Background(), metadata.Object{
-		Bucket: "send", Key: "legacy", Size: int64(len(data)), ETag: md5hex(data),
-		ContentType: "application/octet-stream", TelegramFileID: "legacyfid", TelegramMessageID: 7,
-	}, nil); err != nil {
-		t.Fatalf("seed legacy object: %v", err)
-	}
-
-	rec := getWith(r, "/send/legacy", map[string]string{"Range": "bytes=2-5"})
-	if rec.Code != http.StatusPartialContent {
-		t.Fatalf("status = %d, want 206 (body %s)", rec.Code, rec.Body)
-	}
-	if cr := rec.Header().Get("Content-Range"); cr != fmt.Sprintf("bytes 2-5/%d", len(data)) {
-		t.Fatalf("Content-Range = %q", cr)
-	}
-	if !bytes.Equal(rec.Body.Bytes(), data[2:6]) {
-		t.Fatalf("body = %v, want %v", rec.Body.Bytes(), data[2:6])
-	}
-
-	// Full legacy GET still works (regression guard).
-	rec = getWith(r, "/send/legacy", nil)
-	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), data) {
-		t.Fatalf("full legacy GET: status %d, body match? %v", rec.Code, bytes.Equal(rec.Body.Bytes(), data))
-	}
-}

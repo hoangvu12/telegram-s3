@@ -56,6 +56,25 @@ ceiling after that is Telegram's ~20 MB Bot API download limit (beyond it
 needs a self-hosted local Bot API server and/or splitting one object
 across multiple Telegram messages).
 
+## Phase 3 (multi-bot pool)
+
+- `TELEGRAM_BOT_TOKENS` is now the required comma-separated list of bot
+  tokens. New uploads round-robin across the pool; each chunk's
+  `bot_index` is persisted so reads route back through the same bot
+  (Bot API `file_id` is bot-bound). Put the legacy token first so
+  backfilled rows (`bot_index=0`) keep resolving.
+- `TELEGRAM_BOT_TOKEN` (singular) is kept as a soft fallback: if
+  `TELEGRAM_BOT_TOKENS` is unset and the singular is set, the gateway
+  boots in single-bot mode. Preserved primarily as a rollback target —
+  record the production value before a Phase 3 deploy so a binary revert
+  has the token to restore.
+- Migration is automatic at startup: legacy single-message objects (no
+  `object_chunks` row) get a one-row entry inserted as
+  `(seq=0, offset=0, transport='bot', bot_index=0)`. The legacy fallback
+  branches in `(*Handler).planRead` / `deleteOneObject` /
+  `reapSupersededChunks` are removed; the chunk map is now the sole
+  source of truth on every read/delete path.
+
 ## Ops notes
 
 - Easypanel host `138.2.82.133`. Helper:

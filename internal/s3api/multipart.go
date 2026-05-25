@@ -201,6 +201,7 @@ func (h *Handler) completeMultipartUpload(ctx context.Context, w http.ResponseWr
 		for _, c := range partChunks {
 			finalChunks = append(finalChunks, metadata.Chunk{
 				Seq: seq, FileID: c.FileID, MessageID: c.MessageID, Size: c.Size, Offset: totalSize,
+				Transport: c.Transport, BotIndex: c.BotIndex,
 			})
 			seq++
 			totalSize += c.Size

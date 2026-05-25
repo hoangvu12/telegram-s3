@@ -10,12 +10,26 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string
-	DatabasePath     string
-	AccessKeyID      string
-	SecretAccessKey  string
-	TelegramBotToken string
-	TelegramChatID   string
+	ListenAddr      string
+	DatabasePath    string
+	AccessKeyID     string
+	SecretAccessKey string
+	// TelegramBotTokens is the active multi-bot pool (Phase 3). New uploads
+	// round-robin across it; each chunk's bot_index is persisted so reads
+	// resolve through the same bot under the Bot HTTP API's file_id-bound
+	// model. Parsed from TELEGRAM_BOT_TOKENS (comma-separated). Required.
+	TelegramBotTokens []string
+	// TelegramLegacyBotToken was the single-bot Phase-0..2 token (env
+	// TELEGRAM_BOT_TOKEN). It is preserved for two reasons:
+	//   * deploy rollback: if the binary is reverted before the Phase 4
+	//     migration drains, this value must still resolve legacy chunks.
+	//   * fallback: if TELEGRAM_BOT_TOKENS is unset, treat the legacy token
+	//     as a one-element pool so a partial deploy still boots.
+	// The migration backfills legacy single-message rows with bot_index=0,
+	// which is also TELEGRAM_BOT_TOKENS[0] — operators are expected to put
+	// the legacy token first in the new list.
+	TelegramLegacyBotToken string
+	TelegramChatID         string
 	// TelegramAPIBaseURL defaults to the public Bot API (50 MB send / 20 MB
 	// getFile limits). Point it at a self-hosted local Bot API server to raise
 	// the ceiling to ~2000 MB / unbounded downloads (S3-COMPAT-PLAN.md §3.4).
@@ -62,15 +76,16 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		ListenAddr:             getenv("LISTEN_ADDR", ":9000"),
-		DatabasePath:           getenv("DATABASE_PATH", "telegram-s3.db"),
-		AccessKeyID:            os.Getenv("S3_ACCESS_KEY_ID"),
-		SecretAccessKey:        os.Getenv("S3_SECRET_ACCESS_KEY"),
-		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramChatID:         os.Getenv("TELEGRAM_CHAT_ID"),
-		TelegramAPIBaseURL:     getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
-		TempDir:                getenv("TEMP_DIR", os.TempDir()),
-		PublicEndpointURL:      os.Getenv("PUBLIC_ENDPOINT_URL"),
+		ListenAddr:              getenv("LISTEN_ADDR", ":9000"),
+		DatabasePath:            getenv("DATABASE_PATH", "telegram-s3.db"),
+		AccessKeyID:             os.Getenv("S3_ACCESS_KEY_ID"),
+		SecretAccessKey:         os.Getenv("S3_SECRET_ACCESS_KEY"),
+		TelegramBotTokens:       parseTokenList(os.Getenv("TELEGRAM_BOT_TOKENS")),
+		TelegramLegacyBotToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatID:          os.Getenv("TELEGRAM_CHAT_ID"),
+		TelegramAPIBaseURL:      getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
+		TempDir:                 getenv("TEMP_DIR", os.TempDir()),
+		PublicEndpointURL:       os.Getenv("PUBLIC_ENDPOINT_URL"),
 		MultipartTTL:            getDuration("MULTIPART_TTL", 7*24*time.Hour),
 		MultipartSweepInterval:  getDuration("MULTIPART_SWEEP_INTERVAL", time.Hour),
 		HTTPMaxIdleConnsPerHost: getInt("HTTP_MAX_IDLE_CONNS_PER_HOST", 32),
@@ -83,20 +98,46 @@ func Load() (Config, error) {
 		StreamChunkSize:         getBytes("STREAM_CHUNK_SIZE", 4<<20),
 	}
 
+	// Soft-fallback to the pre-Phase-3 single-token env so a partial deploy
+	// (binary updated, env not yet) still boots in single-bot mode. The
+	// "production deploy note" in PHASES.md still asks operators to set
+	// the plural; this is a safety net, not a recommended steady state.
+	if len(cfg.TelegramBotTokens) == 0 && cfg.TelegramLegacyBotToken != "" {
+		cfg.TelegramBotTokens = []string{cfg.TelegramLegacyBotToken}
+	}
+
 	if cfg.AccessKeyID == "" {
 		return Config{}, errors.New("S3_ACCESS_KEY_ID is required")
 	}
 	if cfg.SecretAccessKey == "" {
 		return Config{}, errors.New("S3_SECRET_ACCESS_KEY is required")
 	}
-	if cfg.TelegramBotToken == "" {
-		return Config{}, errors.New("TELEGRAM_BOT_TOKEN is required")
+	if len(cfg.TelegramBotTokens) == 0 {
+		return Config{}, errors.New("TELEGRAM_BOT_TOKENS is required (comma-separated list; or set TELEGRAM_BOT_TOKEN for single-bot mode)")
 	}
 	if cfg.TelegramChatID == "" {
 		return Config{}, errors.New("TELEGRAM_CHAT_ID is required")
 	}
 
 	return cfg, nil
+}
+
+// parseTokenList splits a comma-separated TELEGRAM_BOT_TOKENS value,
+// trimming whitespace around each entry and dropping empties (so a
+// trailing comma or stray spaces don't produce empty tokens that would
+// confuse the round-robin).
+func parseTokenList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	tokens := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			tokens = append(tokens, t)
+		}
+	}
+	return tokens
 }
 
 func getenv(key, fallback string) string {

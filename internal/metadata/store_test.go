@@ -30,9 +30,13 @@ func TestStoreChunksRoundTrip(t *testing.T) {
 		t.Fatalf("create bucket: %v", err)
 	}
 
+	// Phase 3: Transport/BotIndex round-trip through the new schema columns.
+	// PutObject normalizes empty Transport to "bot" on insert (matching the
+	// column default), so the SELECT side returns "bot" even though the
+	// caller passed "". Keep the literal explicit so equality holds.
 	chunks := []Chunk{
-		{Seq: 0, FileID: "f0", MessageID: 10, Size: 18, Offset: 0},
-		{Seq: 1, FileID: "f1", MessageID: 11, Size: 7, Offset: 18},
+		{Seq: 0, FileID: "f0", MessageID: 10, Size: 18, Offset: 0, Transport: "bot", BotIndex: 0},
+		{Seq: 1, FileID: "f1", MessageID: 11, Size: 7, Offset: 18, Transport: "bot", BotIndex: 0},
 	}
 	obj := Object{Bucket: "send", Key: "a/b.bin", Size: 25, ETag: "etag",
 		ContentType: "application/octet-stream", TelegramFileID: "f0", TelegramMessageID: 10}

@@ -432,33 +432,6 @@ func TestPutObjectOverwriteReapsChunks(t *testing.T) {
 	}
 }
 
-// 8.5 (legacy): a pre-Phase-3 object has no object_chunks rows but a
-// non-zero TelegramMessageID. Reap that one message on overwrite too.
-func TestPutObjectOverwriteReapsLegacy(t *testing.T) {
-	r := newMPRig(t)
-	seedBucket(t, r)
-
-	// Manually seed a legacy single-message row directly in the store.
-	legacyMID := int64(4242)
-	legacy := metadata.Object{
-		Bucket: "send", Key: "legacy", Size: 7, ETag: "deadbeef",
-		ContentType:    "application/octet-stream",
-		TelegramFileID: "f4242", TelegramMessageID: legacyMID,
-	}
-	if err := r.h.store.PutObject(context.Background(), legacy, nil); err != nil {
-		t.Fatalf("seed legacy: %v", err)
-	}
-	// PUT same key -> reap the legacy message.
-	if rec := r.do(http.MethodPut, "/send/legacy", []byte("new")); rec.Code != http.StatusOK {
-		t.Fatalf("put overwrite legacy: %d %s", rec.Code, rec.Body)
-	}
-	r.be.mu.Lock()
-	defer r.be.mu.Unlock()
-	if !r.be.deleted[legacyMID] {
-		t.Fatalf("legacy message %d not reaped on overwrite", legacyMID)
-	}
-}
-
 // 8.5: a failing backend.Delete on reap must NOT 5xx the (successful) PUT.
 func TestPutObjectOverwriteReapErrorTolerated(t *testing.T) {
 	r := newMPRig(t)

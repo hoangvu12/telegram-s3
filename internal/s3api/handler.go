@@ -286,21 +286,16 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 // reapSupersededChunks best-effort drops the previous version's Telegram
 // messages after a successful overwrite. A failure here is logged but never
 // 5xx's the now-durable write — the new object is already authoritative.
-func (h *Handler) reapSupersededChunks(ctx context.Context, oldChunks []metadata.Chunk, prev metadata.Object) {
+// Post Phase 3 the chunk map is authoritative for every non-empty object
+// (legacy single-message rows are backfilled at migration time), so the
+// pre-Phase-3 prev.TelegramMessageID fallback no longer fires.
+func (h *Handler) reapSupersededChunks(ctx context.Context, oldChunks []metadata.Chunk, _ metadata.Object) {
 	refs := chunkRefs(oldChunks)
-	if len(refs) > 0 {
-		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
-			h.logger.Warn("reap superseded chunks failed", "count", len(refs), "error", derr)
-		}
+	if len(refs) == 0 {
+		return
 	}
-	// Legacy single-message row (pre-Phase-3): no object_chunks rows but a
-	// non-zero TelegramMessageID. Reap that one too. Empty objects (Size==0)
-	// never had a Telegram message, so skip them.
-	if len(oldChunks) == 0 && prev.Size > 0 && prev.TelegramMessageID != 0 {
-		ref := storage.ChunkRef{Transport: storage.TransportBot, BotFileID: prev.TelegramFileID, MessageID: prev.TelegramMessageID}
-		if derr := h.backend.Delete(ctx, ref); derr != nil && h.logger != nil {
-			h.logger.Warn("reap legacy superseded object failed", "message_id", prev.TelegramMessageID, "error", derr)
-		}
+	if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
+		h.logger.Warn("reap superseded chunks failed", "count", len(refs), "error", derr)
 	}
 }
 
@@ -459,10 +454,11 @@ func (h *Handler) getObject(ctx context.Context, w http.ResponseWriter, r *http.
 }
 
 // planRead converts an object + its chunk map + optional range into the
-// (locs, start, end) triple the parallel prefetch reader consumes. Legacy
-// single-message objects (pre-Phase-3) collapse to a single ChunkLoc
-// covering the whole object. Empty objects yield no locs and start==end,
-// so the caller can short-circuit before constructing a reader.
+// (locs, start, end) triple the parallel prefetch reader consumes. Post
+// Phase 3 every non-empty object has at least one object_chunks row (the
+// migration backfills legacy single-message rows), so the chunked path is
+// the only path. Empty objects (size == 0) yield no locs and start == end,
+// so the caller short-circuits before constructing a reader.
 func (h *Handler) planRead(obj metadata.Object, chunks []metadata.Chunk, rng *httpRange) ([]reader.ChunkLoc, int64, int64) {
 	var start, end int64
 	if rng != nil {
@@ -472,23 +468,14 @@ func (h *Handler) planRead(obj metadata.Object, chunks []metadata.Chunk, rng *ht
 		end = obj.Size
 	}
 
-	if len(chunks) > 0 {
-		locs := make([]reader.ChunkLoc, 0, len(chunks))
-		for _, c := range chunks {
-			locs = append(locs, reader.ChunkLoc{Ref: metaChunkRef(c), Offset: c.Offset, Size: c.Size})
-		}
-		return locs, start, end
+	if len(chunks) == 0 {
+		return nil, start, end
 	}
-	if obj.Size > 0 {
-		// Legacy single-message object (pre-Phase-3): one loc spans
-		// the whole object.
-		return []reader.ChunkLoc{{
-			Ref:    storage.ChunkRef{Transport: storage.TransportBot, BotFileID: obj.TelegramFileID, MessageID: obj.TelegramMessageID},
-			Offset: 0,
-			Size:   obj.Size,
-		}}, start, end
+	locs := make([]reader.ChunkLoc, 0, len(chunks))
+	for _, c := range chunks {
+		locs = append(locs, reader.ChunkLoc{Ref: metaChunkRef(c), Offset: c.Offset, Size: c.Size})
 	}
-	return nil, start, end
+	return locs, start, end
 }
 
 // metaChunkRef builds a ChunkRef from a single metadata.Chunk row, applying
@@ -666,8 +653,7 @@ func (h *Handler) deleteObject(ctx context.Context, w http.ResponseWriter, bucke
 // (DELETE is idempotent). A failed message delete is logged but does not block
 // metadata removal — the object must still disappear from the namespace.
 func (h *Handler) deleteOneObject(ctx context.Context, bucket, key string) error {
-	obj, err := h.store.GetObject(ctx, bucket, key)
-	if err != nil {
+	if _, err := h.store.GetObject(ctx, bucket, key); err != nil {
 		if errors.Is(err, metadata.ErrNotFound) {
 			return nil
 		}
@@ -678,15 +664,12 @@ func (h *Handler) deleteOneObject(ctx context.Context, bucket, key string) error
 		return err
 	}
 
-	if len(chunks) > 0 {
-		refs := chunkRefs(chunks)
+	// Post Phase 3 the chunk map is authoritative: legacy single-message
+	// rows were backfilled at migration time, so a non-empty object always
+	// has at least one chunk to reap. Empty objects skip the batch.
+	if refs := chunkRefs(chunks); len(refs) > 0 {
 		if derr := h.backend.DeleteBatch(ctx, refs); derr != nil && h.logger != nil {
 			h.logger.Warn("delete telegram chunks failed", "key", key, "count", len(refs), "error", derr)
-		}
-	} else if obj.Size > 0 && obj.TelegramMessageID != 0 { // legacy single-message
-		ref := storage.ChunkRef{Transport: storage.TransportBot, BotFileID: obj.TelegramFileID, MessageID: obj.TelegramMessageID}
-		if derr := h.backend.Delete(ctx, ref); derr != nil && h.logger != nil {
-			h.logger.Warn("delete telegram object failed", "key", key, "error", derr)
 		}
 	}
 

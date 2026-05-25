@@ -39,7 +39,7 @@ func main() {
 	defer pathCache.Close()
 
 	backend := telegram.NewBotStorageWithOptions(
-		cfg.TelegramBotToken,
+		cfg.TelegramBotTokens,
 		cfg.TelegramChatID,
 		cfg.TelegramAPIBaseURL,
 		cfg.HTTPMaxIdleConnsPerHost,

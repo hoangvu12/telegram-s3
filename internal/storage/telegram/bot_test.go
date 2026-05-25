@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"telegram-s3/internal/cache"
+	"telegram-s3/internal/storage"
 )
 
 // fakeTelegram mocks the Bot API endpoints bot.go uses.
@@ -324,7 +325,7 @@ func TestUploadExactMultipleOfChunkSize(t *testing.T) {
 // existing tests still exercise the no-cache fallback.
 func newTestBotWithCache(t *testing.T, f *fakeTelegram, chunkSize int, c *cache.Cache[string, string]) *BotStorage {
 	srv := f.server(t)
-	b := NewBotStorageWithOptions("TOKEN", "chat123", srv.URL, 0, 0, c, nil)
+	b := NewBotStorageWithOptions([]string{"TOKEN"}, "chat123", srv.URL, 0, 0, c, nil)
 	b.chunkSize = chunkSize
 	return b
 }
@@ -411,6 +412,169 @@ func TestDownloadInvalidatesOnCDN404(t *testing.T) {
 	defer f.mu.Unlock()
 	if delta := f.getFileCalls - gfBefore; delta != 1 {
 		t.Fatalf("expected exactly 1 re-resolve, got %d", delta)
+	}
+}
+
+// multiBotFake is a token-agnostic version of fakeTelegram used for Phase 3
+// pool tests. Routes are dispatched by parsing the {token} segment of
+// /bot{token}/{method}, so any number of tokens can hit the same server
+// concurrently and the test can verify which one handled each call.
+type multiBotFake struct {
+	mu sync.Mutex
+	// uploadsByToken counts sendDocument hits per token — the test
+	// assertion confirms round-robin spread the upload load.
+	uploadsByToken map[string]int
+	// fileByID records every stored file_id → which token sent it. Used to
+	// assert that download routes back through the same token on read.
+	fileByID  map[string]string
+	seq       int64
+	getFileBy map[string]int // file_id -> count of getFile resolves
+}
+
+func newMultiBotFake() *multiBotFake {
+	return &multiBotFake{
+		uploadsByToken: map[string]int{},
+		fileByID:       map[string]string{},
+		getFileBy:      map[string]int{},
+	}
+}
+
+// parseBotPath extracts (token, method) from /bot{token}/{method} or
+// /file/bot{token}/{path...}. Returns "" token if the path doesn't match.
+func parseBotPath(path string) (token, rest string, isFile bool) {
+	if strings.HasPrefix(path, "/file/bot") {
+		tail := strings.TrimPrefix(path, "/file/bot")
+		if i := strings.IndexByte(tail, '/'); i >= 0 {
+			return tail[:i], tail[i+1:], true
+		}
+		return "", "", true
+	}
+	if strings.HasPrefix(path, "/bot") {
+		tail := strings.TrimPrefix(path, "/bot")
+		if i := strings.IndexByte(tail, '/'); i >= 0 {
+			return tail[:i], tail[i+1:], false
+		}
+	}
+	return "", "", false
+}
+
+func (f *multiBotFake) server(t *testing.T) *httptest.Server {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, rest, isFile := parseBotPath(r.URL.Path)
+		if token == "" {
+			http.NotFound(w, r)
+			return
+		}
+		switch {
+		case isFile:
+			fileID := strings.TrimPrefix(rest, "stored/")
+			f.mu.Lock()
+			storingToken := f.fileByID[fileID]
+			f.mu.Unlock()
+			// Reads must come back through the SAME token that uploaded —
+			// Bot API file_id is bot-bound. The fake enforces that contract.
+			if storingToken != token {
+				http.Error(w, "file_id not bound to this bot", http.StatusForbidden)
+				return
+			}
+			http.ServeContent(w, r, fileID, time.Time{}, bytes.NewReader([]byte(fileID)))
+		case rest == "sendDocument":
+			if err := r.ParseMultipartForm(64 << 20); err != nil {
+				t.Errorf("sendDocument parse: %v", err)
+			}
+			f.mu.Lock()
+			f.uploadsByToken[token]++
+			f.seq++
+			fileID := fmt.Sprintf("file-%d", f.seq)
+			msgID := 1000 + f.seq
+			f.fileByID[fileID] = token
+			f.mu.Unlock()
+			fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d,"document":{"file_id":%q}}}`, msgID, fileID)
+		case rest == "getFile":
+			r.ParseForm()
+			fileID := r.FormValue("file_id")
+			f.mu.Lock()
+			f.getFileBy[fileID]++
+			f.mu.Unlock()
+			fmt.Fprintf(w, `{"ok":true,"result":{"file_path":%q}}`, "stored/"+fileID)
+		case rest == "deleteMessage":
+			w.Write([]byte(`{"ok":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestUploadRoundRobinsAcrossTokens: with 2 tokens, six PUTs (one chunk
+// each) tag chunks with alternating BotIndex values, and every chunk is
+// readable through its assigned bot. This is the Phase 3 end-to-end
+// acceptance hint from PHASES.md: bot_index = [0,1,0,1,0,1].
+func TestUploadRoundRobinsAcrossTokens(t *testing.T) {
+	ctx := context.Background()
+	f := newMultiBotFake()
+	srv := f.server(t)
+
+	tokens := []string{"TOKA", "TOKB"}
+	b := NewBotStorageWithOptions(tokens, "chat", srv.URL, 0, 0, nil, nil)
+	b.chunkSize = 1 << 20 // one chunk per object for clarity
+
+	wantSeq := []int{0, 1, 0, 1, 0, 1}
+	gotSeq := make([]int, 0, len(wantSeq))
+	for i := 0; i < len(wantSeq); i++ {
+		chunks, err := b.Upload(ctx, fmt.Sprintf("obj%d", i), "application/octet-stream", bytes.NewReader([]byte("x")))
+		if err != nil {
+			t.Fatalf("upload %d: %v", i, err)
+		}
+		if len(chunks) != 1 {
+			t.Fatalf("upload %d: %d chunks, want 1", i, len(chunks))
+		}
+		gotSeq = append(gotSeq, chunks[0].BotIndex)
+		// Read-back through the right bot must succeed (file_id is bound).
+		rc, err := b.DownloadRange(ctx, chunks[0].Ref(), 0, 0)
+		if err != nil {
+			t.Fatalf("read back %d: %v", i, err)
+		}
+		rc.Close()
+	}
+	for i, want := range wantSeq {
+		if gotSeq[i] != want {
+			t.Fatalf("bot_index sequence = %v, want %v", gotSeq, wantSeq)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.uploadsByToken["TOKA"] != 3 || f.uploadsByToken["TOKB"] != 3 {
+		t.Fatalf("upload distribution = %v, want 3 per token", f.uploadsByToken)
+	}
+}
+
+// TestDownloadFailsForOutOfRangeBotIndex: a row written on a larger pool
+// then read on a smaller pool returns a clean error (the BotPool.At
+// safety net) rather than panicking on a slice-index out of bounds.
+func TestDownloadFailsForOutOfRangeBotIndex(t *testing.T) {
+	f := newMultiBotFake()
+	srv := f.server(t)
+	b := NewBotStorageWithOptions([]string{"TOKA"}, "chat", srv.URL, 0, 0, nil, nil)
+	_, err := b.DownloadRange(context.Background(), storageRefForBot(2, "file-1", 1001), 0, 0)
+	if err == nil {
+		t.Fatal("expected error for bot_index beyond pool size")
+	}
+	if !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("error = %v, want one mentioning 'out of range'", err)
+	}
+}
+
+// storageRefForBot constructs a ChunkRef for the multi-bot fake without
+// dragging the s3api package's helpers into the storage tests.
+func storageRefForBot(botIndex int, fileID string, messageID int64) storage.ChunkRef {
+	return storage.ChunkRef{
+		Transport: storage.TransportBot,
+		BotFileID: fileID,
+		MessageID: messageID,
+		BotIndex:  botIndex,
 	}
 }
 
