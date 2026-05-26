@@ -53,7 +53,7 @@ func (f *fakeBackend) Upload(_ context.Context, _, _ string, body io.Reader) ([]
 		mid := 1000 + f.seq
 		f.files[fid] = piece
 		f.mu.Unlock()
-		chunks = append(chunks, storage.Chunk{Seq: seq, FileID: fid, MessageID: mid, Size: int64(len(piece)), Offset: int64(off), Transport: storage.TransportBot})
+		chunks = append(chunks, storage.Chunk{Seq: seq, FileID: fid, MessageID: mid, Size: int64(len(piece)), Offset: int64(off), Transport: storage.TransportMTProto})
 		off = end
 	}
 	return chunks, nil

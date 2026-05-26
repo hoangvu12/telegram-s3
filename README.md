@@ -2,7 +2,8 @@
 
 S3-compatible gateway backed by Telegram. Objects are chunked and
 stored as documents in a Telegram channel; reads stream the chunks
-back through the S3 API.
+back through the S3 API. Storage is MTProto-only (via `gotd/td`); the
+Bot HTTP API path was removed in Phase 5 after the migration drained.
 
 Personal-scale only. Telegram is not a real object-storage service —
 no SLA, no per-object durability guarantees, throughput is bounded
@@ -20,11 +21,10 @@ mostly-static asset host) that fits the trade-offs.
   own chunked upload)
 - **Large objects** — chunks are stitched, no Telegram document
   size limit applies to objects
-- **Dual transport** — Bot HTTP API for legacy data + MTProto for
-  new writes, with a background sweeper migrating between them
 - Static AWS SigV4 credentials
 - SQLite metadata with WAL writer/reader split
 - Per-bot session multiplexing (gotd connection pool)
+- Multi-bot round-robin for both uploads and reads
 - Health endpoint at `GET /healthz` (returns 204)
 
 ## Not implemented
@@ -45,9 +45,6 @@ from CDN; if your deployment hits this, see `download.go`'s
 
 ### 2. Get MTProto app credentials
 
-Required for `TELEGRAM_TRANSPORT=dual` or `mtproto`. Skip if you're
-running pure Bot-API mode (`TELEGRAM_TRANSPORT=bot`, the default).
-
 1. Visit <https://my.telegram.org/auth> and log in with your phone
    number.
 2. → "API development tools" → fill in a basic app description.
@@ -59,8 +56,7 @@ running pure Bot-API mode (`TELEGRAM_TRANSPORT=bot`, the default).
 1. In Telegram, create a **private supergroup or channel**.
 2. Add your bot as an **administrator** with these rights:
    - **Post Messages** — required, otherwise the bot can't upload
-   - **Delete Messages** — recommended (also see "Zombie messages"
-     limitation below)
+   - **Delete Messages** — recommended
    - Other rights are optional; the bot doesn't use them.
 3. Get the channel's chat_id. Easiest way: post a message in the
    channel, forward it to `@RawDataBot`, copy `forward_from_chat.id`.
@@ -71,10 +67,9 @@ running pure Bot-API mode (`TELEGRAM_TRANSPORT=bot`, the default).
 
 ```bash
 cp .env.example .env
-# Edit .env — at minimum set TELEGRAM_BOT_TOKEN (or TELEGRAM_BOT_TOKENS),
-# TELEGRAM_CHAT_ID, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY.
-# If using TELEGRAM_TRANSPORT=dual or mtproto, also set
-# TELEGRAM_APP_ID and TELEGRAM_APP_HASH.
+# Edit .env — at minimum set TELEGRAM_BOT_TOKENS, TELEGRAM_CHAT_ID,
+# TELEGRAM_APP_ID, TELEGRAM_APP_HASH, S3_ACCESS_KEY_ID,
+# S3_SECRET_ACCESS_KEY.
 
 go run ./cmd/telegram-s3
 ```
@@ -94,77 +89,21 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://test
 aws --endpoint-url http://localhost:9000 s3 cp s3://test/some-file ./downloaded
 ```
 
-## Transport modes
-
-| Mode | New uploads | Old reads | Use when |
-|---|---|---|---|
-| `bot` (default) | Bot HTTP API | Bot HTTP API | Bootstrap, simplest setup, no MTProto creds needed |
-| `dual` | MTProto | Bot OR MTProto (per chunk) + background sweeper migrates `bot → mtproto` | Migrating an existing deploy off Bot API |
-| `mtproto` | MTProto | MTProto only | Once the sweeper has drained all `bot` chunks |
-
-**Going from `bot` to `mtproto` is a two-step migration:**
-
-1. Flip env to `TELEGRAM_TRANSPORT=dual`. New uploads land via
-   MTProto; old chunks stay readable via Bot API; sweeper drains in
-   the background.
-2. Watch `bot_chunks_remaining` (logged in `drain snapshot` lines).
-   When it hits 0, flip env to `TELEGRAM_TRANSPORT=mtproto`.
-
-The sweeper rate is bounded by `MIGRATION_RATE` (rows/day) × the
-parallel fan-out set by `MIGRATION_WORKERS` (default 4). Per-tick the
-sweeper picks `MIGRATION_RATE × 60 / 86400` rows and migrates them
-across that many goroutines. Realistic numbers per single bot at the
-default `MIGRATION_WORKERS=4`:
-
-| MIGRATION_RATE | Per-tick budget | Effective (4 workers) | Note |
-|---|---|---|---|
-| 1000 | 1 | ~1000/day | Conservative; barely uses fan-out |
-| 10000 | 6 | ~8640/day | Default ceiling — 60s tick clamp; budget = floor of `rate × 60 / 86400` |
-| 40000 | 27 | ~38000/day | Saturates 4 workers per tick (~6 chunks per worker per minute at ~10s wall time) |
-| 80000+ | 55+ | bot-API + MTProto FLOOD_WAIT | Past this you'll trip rate-limits; add a 2nd token via `TELEGRAM_BOT_TOKENS=tok1,tok2,...` instead |
-
-Lower `MIGRATION_WORKERS` to throttle without changing `MIGRATION_RATE`
-(e.g. while debugging FLOOD_WAIT). Clamped to `[1, 32]`.
-
 ## Configuration reference
 
 The full env surface is documented inline in `.env.example`. Highlights:
 
 - **Tokens:** `TELEGRAM_BOT_TOKENS=tok1,tok2,...` (comma-separated)
-  enables multi-bot round-robin for both uploads and reads. The
-  legacy singular `TELEGRAM_BOT_TOKEN` is supported as a fallback.
+  enables multi-bot round-robin for both uploads and reads. Each bot
+  authenticates its own MTProto session.
+- **MTProto:** `TELEGRAM_APP_ID`, `TELEGRAM_APP_HASH`,
+  `TELEGRAM_POOL_SIZE`, `TELEGRAM_UPLOAD_THREADS`.
 - **Tuning:** `HTTP_MAX_IDLE_CONNS_PER_HOST`, `SQLITE_READER_CONNS`,
   `STREAM_CONCURRENCY`, `STREAM_BUFFERS`, `STREAM_CHUNK_SIZE`,
-  `CHUNK_TIMEOUT`, `LOCATION_CACHE_TTL`, `TELEGRAM_MAX_CHUNK_SIZE`,
-  `TELEGRAM_POOL_SIZE`, `TELEGRAM_UPLOAD_THREADS` — all have safe
-  defaults; tweak only if profiling says so.
-- **Migration:** `MIGRATION_RATE`, `MIGRATION_WORKERS`, `BOT_DELETE_GRACE`.
+  `CHUNK_TIMEOUT`, `LOCATION_CACHE_TTL`, `TELEGRAM_MAX_CHUNK_SIZE`
+  — all have safe defaults; tweak only if profiling says so.
 
 ## Known limitations
-
-### Zombie messages after migration
-
-When migrating `bot → mtproto`, the sweeper's pass-1 atomically
-swaps the chunk row to point at the new MTProto-uploaded copy. The
-old bot-API-uploaded message in the channel is supposed to be
-deleted in a separate pass-2 sweep after a grace window.
-
-**Telegram refuses to let bots delete sufficiently-old messages**,
-even with `can_delete_messages` admin right. The Bot API surfaces
-this as a 48h limit; MTProto returns `MESSAGE_DELETE_FORBIDDEN`. No
-admin permission overrides it for bot identities.
-
-Workaround: set `BOT_DELETE_GRACE=999h` (or any very large value).
-Pass-2 never finds rows to reap. The old bot messages stay in the
-channel forever as "zombies" — they're inaccessible via S3 (chunk
-map points to the new mtproto copies) but cost ~1 message slot
-each in the channel. For most users this is fine; Telegram channels
-have effectively unlimited message capacity.
-
-If channel clutter matters, you can run a user-account MTProto
-script (Telethon, etc.) to delete them — user accounts have looser
-delete rules and can clean admin/bot messages in chats they own.
-This isn't built into this project.
 
 ### Telegram is not real object storage
 
@@ -192,22 +131,13 @@ HTTP S3 ───▶│   internal/s3api    │
             └──────────┬──────────┘
                        │  ChunkRef
                        ▼
-            ┌─────────────────────┐
-            │ storage.Dispatcher  │── routes by ref.Transport
-            └─────┬───────────┬───┘
-                  │           │
-       transport=bot      transport=mtproto
-                  │           │
-                  ▼           ▼
-            ┌──────────┐  ┌──────────┐
-            │BotStorage│  │ MTProto  │
-            │(HTTP API)│  │ (gotd/td)│
-            └──────────┘  └──────────┘
-                  │           │
-                  └─────┬─────┘
-                        ▼
-              Telegram channel
-              (single supergroup)
+            ┌──────────────────────────┐
+            │ mtproto.Storage (gotd/td)│
+            └────────────┬─────────────┘
+                         │
+                         ▼
+                Telegram channel
+                (single supergroup)
 ```
 
 - **`internal/s3api`** — S3 API surface (SigV4 auth, request
@@ -215,16 +145,12 @@ HTTP S3 ───▶│   internal/s3api    │
   the `Backend` interface.
 - **`internal/reader`** — parallel-prefetch reader. N concurrent
   chunk fetches, ordered delivery.
-- **`internal/storage`** — `Backend` interface + dispatcher.
-- **`internal/storage/telegram`** — Bot HTTP API backend.
+- **`internal/storage`** — `Backend` interface.
 - **`internal/storage/telegram/mtproto`** — MTProto backend via
   `gotd/td`. Includes session pool for multiplexing per-bot RPCs.
-- **`internal/migrate`** — background two-pass sweeper that drains
-  `transport='bot'` rows into MTProto.
 - **`internal/metadata`** — SQLite metadata (objects, chunks,
-  multipart parts, MTProto session storage, pending-delete queue).
-- **`internal/cache`** — generic TTL cache. Bot-API uses it for
-  `(file_id → file_path)`; MTProto uses it for
+  multipart parts, MTProto session storage).
+- **`internal/cache`** — generic TTL cache for
   `(message_id, bot_index → InputDocumentFileLocation)`.
 
 ## Development
@@ -238,9 +164,7 @@ go build -o telegram-s3 ./cmd/telegram-s3
 ```
 
 Tests are mocks-only against `*tg.Client` for the MTProto layer; no
-live Telegram needed. The migration sweeper has its own in-memory
-backend fake so two-pass invariants can be exercised without standing
-up a real channel.
+live Telegram needed.
 
 ## Credits
 

@@ -379,7 +379,7 @@ func TestBotSourceFullReadStraddlesMessages(t *testing.T) {
 		fid := fmt.Sprintf("file-%d", off)
 		be.blobs[fid] = buildBlob(off, end)
 		locs = append(locs, ChunkLoc{
-			Ref:    storage.ChunkRef{Transport: storage.TransportBot, BotFileID: fid},
+			Ref:    storage.ChunkRef{Transport: storage.TransportMTProto, BotFileID: fid},
 			Offset: off,
 			Size:   end - off,
 		})
@@ -411,7 +411,7 @@ func TestBotSourceRangeAcrossMessages(t *testing.T) {
 		fid := fmt.Sprintf("f-%d", off)
 		be.blobs[fid] = buildBlob(off, off+uploadSize)
 		locs = append(locs, ChunkLoc{
-			Ref:    storage.ChunkRef{Transport: storage.TransportBot, BotFileID: fid},
+			Ref:    storage.ChunkRef{Transport: storage.TransportMTProto, BotFileID: fid},
 			Offset: off,
 			Size:   uploadSize,
 		})

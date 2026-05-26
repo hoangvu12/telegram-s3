@@ -12,7 +12,6 @@ import (
 	"github.com/gotd/td/tgerr"
 
 	"telegram-s3/internal/storage"
-	parent "telegram-s3/internal/storage/telegram"
 )
 
 // mtprotoDownloadChunk is the maximum bytes per UploadGetFile call.
@@ -22,21 +21,16 @@ import (
 // download size, so use the max.
 const mtprotoDownloadChunk = 1 << 20
 
-// Download returns a ReadCloser over the full chunk's bytes. This is
-// the "no range" path BotStorage exposes for parity, used by the
-// migration sweeper's pass-1 (it pulls the whole chunk via the BOT
-// transport then re-uploads via MTProto; the reciprocal path isn't
-// exercised in production, but the dispatcher's conformance tests
-// expect both backends to implement it).
+// Download returns a ReadCloser over the full chunk's bytes.
 func (s *Storage) Download(ctx context.Context, ref storage.ChunkRef) (io.ReadCloser, error) {
 	return s.DownloadRange(ctx, ref, 0, 0)
 }
 
 // DownloadRange returns [offset, offset+length) of the chunk's bytes.
-// length <= 0 means "to end of chunk" (matching BotStorage). The
-// returned ReadCloser buffers the whole response in memory — the
-// parallel-prefetch reader's bounded chunk size keeps that buffer
-// small (typically 1 MiB × ChunkSource step).
+// length <= 0 means "to end of chunk". The returned ReadCloser
+// buffers the whole response in memory — the parallel-prefetch
+// reader's bounded chunk size keeps that buffer small (typically
+// 1 MiB × ChunkSource step).
 //
 // Lookup is bot-affinity-first (ref.BotIndex), falling back to
 // round-robin across the rest of the pool on transient errors:
@@ -45,9 +39,6 @@ func (s *Storage) Download(ctx context.Context, ref storage.ChunkRef) (io.ReadCl
 // fatal — every bot would fail the same way — and surface
 // immediately without burning more pool slots.
 func (s *Storage) DownloadRange(ctx context.Context, ref storage.ChunkRef, offset, length int64) (io.ReadCloser, error) {
-	if ref.Transport != storage.TransportMTProto {
-		return nil, fmt.Errorf("mtproto: ref transport %q, want %q", ref.Transport, storage.TransportMTProto)
-	}
 	if offset < 0 {
 		return nil, fmt.Errorf("mtproto: negative offset %d", offset)
 	}
@@ -61,7 +52,7 @@ func (s *Storage) DownloadRange(ctx context.Context, ref storage.ChunkRef, offse
 		// Pool shrunk underneath a row written on a larger deploy. Fall
 		// back to round-robin — under MTProto any bot can resolve the
 		// message (unlike Bot API file_ids which are bot-bound).
-		_, primary = s.pool.Pick(parent.BotOpStream)
+		_, primary = s.pool.Pick(BotOpStream)
 	}
 
 	rc, err := s.downloadViaBot(ctx, primary, ref, offset, end)

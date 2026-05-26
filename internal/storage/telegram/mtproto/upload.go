@@ -11,31 +11,26 @@ import (
 	"github.com/gotd/td/tg"
 
 	"telegram-s3/internal/storage"
-	parent "telegram-s3/internal/storage/telegram"
 )
 
 // Upload chunks the body and sends each chunk as its own Telegram
-// document via MTProto. Mirrors BotStorage.Upload in shape — same
-// chunk size, same per-chunk bot rotation, same offset/seq bookkeeping
-// — so the chunk map shape is invariant across transports and the
-// dispatcher / reader / sweeper don't need transport-specific logic.
-//
-// Each chunk is uploaded with uploader.NewUploader at 512 KiB part
-// size (the only MTProto-compatible part size that fills the 2 GiB
-// per-document envelope) and `s.uploadThreads` parallel parts.
-// Telegram's flood/rate middleware is wired into the *tg.Client at
-// pool construction time, so retries on FLOOD_WAIT happen for free.
+// document via MTProto. Each chunk is uploaded with
+// uploader.NewUploader at 512 KiB part size (the only
+// MTProto-compatible part size that fills the 2 GiB per-document
+// envelope) and `s.uploadThreads` parallel parts. Telegram's flood/
+// rate middleware is wired into the *tg.Client at pool construction
+// time, so retries on FLOOD_WAIT happen for free.
 func (s *Storage) Upload(ctx context.Context, name, contentType string, body io.Reader) ([]storage.Chunk, error) {
 	var chunks []storage.Chunk
 	var offset int64
-	scratch := make([]byte, 64<<10) // io.CopyBuffer reuse, like BotStorage
+	scratch := make([]byte, 64<<10) // io.CopyBuffer reuse
 	var buf bytes.Buffer
 
 	for seq := 0; ; seq++ {
 		buf.Reset()
 		n, rerr := io.CopyBuffer(&buf, io.LimitReader(body, int64(s.chunkSize)), scratch)
 		if n > 0 {
-			botIdx, bot := s.pool.Pick(parent.BotOpUpload)
+			botIdx, bot := s.pool.Pick(BotOpUpload)
 			ch, err := s.uploadChunk(ctx, bot, name, contentType, seq, buf.Bytes(), n)
 			if err != nil {
 				s.cleanup(ctx, chunks)
@@ -191,8 +186,8 @@ func (s *Storage) deleteByMessageID(ctx context.Context, bot *MTProtoBot, msgID 
 }
 
 // cleanup best-effort deletes chunks already uploaded when a later
-// chunk fails — same contract as BotStorage.cleanup. Per-chunk
-// failures are logged; the original Upload error is what surfaces.
+// chunk fails. Per-chunk failures are logged; the original Upload
+// error is what surfaces.
 func (s *Storage) cleanup(ctx context.Context, chunks []storage.Chunk) {
 	if len(chunks) == 0 {
 		return

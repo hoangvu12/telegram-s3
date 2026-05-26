@@ -14,51 +14,32 @@ type Config struct {
 	DatabasePath    string
 	AccessKeyID     string
 	SecretAccessKey string
-	// TelegramBotTokens is the active multi-bot pool (Phase 3). New uploads
-	// round-robin across it; each chunk's bot_index is persisted so reads
-	// resolve through the same bot under the Bot HTTP API's file_id-bound
-	// model. Parsed from TELEGRAM_BOT_TOKENS (comma-separated). Required.
+	// TelegramBotTokens is the multi-bot pool. Each bot authenticates its
+	// own MTProto session via auth.importBotAuthorization; new uploads
+	// round-robin across the pool and each chunk's bot_index is persisted
+	// so reads resolve through the same bot. Required.
 	TelegramBotTokens []string
-	// TelegramLegacyBotToken was the single-bot Phase-0..2 token (env
-	// TELEGRAM_BOT_TOKEN). It is preserved for two reasons:
-	//   * deploy rollback: if the binary is reverted before the Phase 4
-	//     migration drains, this value must still resolve legacy chunks.
-	//   * fallback: if TELEGRAM_BOT_TOKENS is unset, treat the legacy token
-	//     as a one-element pool so a partial deploy still boots.
-	// The migration backfills legacy single-message rows with bot_index=0,
-	// which is also TELEGRAM_BOT_TOKENS[0] — operators are expected to put
-	// the legacy token first in the new list.
-	TelegramLegacyBotToken string
-	TelegramChatID         string
-	// TelegramAPIBaseURL defaults to the public Bot API (50 MB send / 20 MB
-	// getFile limits). Point it at a self-hosted local Bot API server to raise
-	// the ceiling to ~2000 MB / unbounded downloads (S3-COMPAT-PLAN.md §3.4).
-	TelegramAPIBaseURL string
-	TempDir            string
-	PublicEndpointURL  string
+	TelegramChatID    string
+	TempDir           string
+	PublicEndpointURL string
 	// MultipartTTL is how long an in-progress multipart upload may sit
 	// untouched before the janitor aborts it (P8.6). MultipartSweepInterval
 	// is how often the janitor runs; <= 0 disables the sweep entirely.
 	MultipartTTL           time.Duration
 	MultipartSweepInterval time.Duration
-	// HTTPMaxIdleConnsPerHost bounds the keepalive pool the Telegram client
-	// reuses across chunk requests. Go's default of 2 silently throttles
-	// concurrent uploads/downloads — every chunk past the second pays a TLS
-	// handshake. 32 keeps the pool large enough for the stream-prefetch
-	// fan-out introduced in Phase 2 without bloating memory.
+	// HTTPMaxIdleConnsPerHost bounds the keepalive pool any HTTP client
+	// in the gateway reuses. Kept tunable for future HTTP-using paths;
+	// MTProto itself does not use this.
 	HTTPMaxIdleConnsPerHost int
 	// SQLiteReaderConns bounds the read-only *sql.DB. WAL allows many
 	// concurrent readers and one writer; we open a separate single-conn
 	// writer pool, so this knob only governs the SELECT side.
 	SQLiteReaderConns int
-	// LocationCacheTTL is how long a resolved Bot API file_path is cached
-	// under its file_id. Telegram's docs say a file_path is valid for at
-	// least an hour; 30m is a safe default that survives the longest reads
-	// we issue (range fetches over chunked objects). Phase 1.
+	// LocationCacheTTL is how long a resolved MTProto location is cached.
 	LocationCacheTTL time.Duration
-	// TelegramMaxChunkSize is the upload chunk window. 18 MiB stays under
-	// the public Bot API 20 MB getFile cap; users running a self-hosted
-	// `tdlib/telegram-bot-api` server can raise this to ~1.9 GiB. Phase 1.
+	// TelegramMaxChunkSize is the upload chunk window. 18 MiB is the
+	// Phase 4 default to stay consistent with the migrated rows; MTProto
+	// permits larger but we keep parity with historical chunking.
 	TelegramMaxChunkSize int64
 	// StreamConcurrency / StreamBuffers / ChunkTimeout govern the
 	// parallel-prefetch reader on the object GET path (Phase 2).
@@ -72,35 +53,11 @@ type Config struct {
 	StreamBuffers     int
 	ChunkTimeout      time.Duration
 	StreamChunkSize   int64
-	// Phase 4 — MTProto backend + dispatcher knobs. Default
-	// TelegramTransport="bot" is a deploy-time no-op: only BotStorage
-	// runs and the dispatcher routes everything to it. Flip to "dual"
-	// to start writing new chunks via MTProto while old chunks keep
-	// reading via the Bot API (and the sweeper drains them in the
-	// background). Flip to "mtproto" only after the sweeper has
-	// drained every transport='bot' row.
-	TelegramTransport     string
-	TelegramAppID         int    // from my.telegram.org; required when transport != "bot"
-	TelegramAppHash       string // from my.telegram.org; required when transport != "bot"
+	// MTProto knobs.
+	TelegramAppID         int    // from my.telegram.org
+	TelegramAppHash       string // from my.telegram.org
 	TelegramPoolSize      int    // gotd pool.Pool size per bot (session multiplexing)
 	TelegramUploadThreads int    // uploader.WithThreads per upload
-	// MigrationRate is the sweeper's pass-1 throughput cap in rows/day.
-	// 0 disables the sweeper entirely (the dispatcher still routes new
-	// uploads via MTProto in dual mode, but no migration happens).
-	MigrationRate int
-	// MigrationWorkers caps pass-1 concurrency within a single tick. Each
-	// worker holds one in-flight (bot download + mtproto upload) pair, so
-	// e.g. 4 workers lets 4 chunks migrate at once instead of serialized.
-	// Default 4, clamped to [1, 32]. Tune up only if profiling says the
-	// MTProto session pool / bot HTTP API can absorb more parallelism
-	// without tripping FLOOD_WAIT.
-	MigrationWorkers int
-	// BotDeleteGrace is how long a migrated bot message lingers in
-	// bot_chunks_pending_delete before the sweeper's pass-2 reaps it.
-	// See PHASES.md design decision #14: this window prevents a reader
-	// that fetched the chunk map just before the swap from 404'ing on a
-	// permanent delete. Minimum 1m; 0 forces immediate delete (test-only).
-	BotDeleteGrace time.Duration
 }
 
 func Load() (Config, error) {
@@ -110,9 +67,7 @@ func Load() (Config, error) {
 		AccessKeyID:             os.Getenv("S3_ACCESS_KEY_ID"),
 		SecretAccessKey:         os.Getenv("S3_SECRET_ACCESS_KEY"),
 		TelegramBotTokens:       parseTokenList(os.Getenv("TELEGRAM_BOT_TOKENS")),
-		TelegramLegacyBotToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramChatID:          os.Getenv("TELEGRAM_CHAT_ID"),
-		TelegramAPIBaseURL:      getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
 		TempDir:                 getenv("TEMP_DIR", os.TempDir()),
 		PublicEndpointURL:       os.Getenv("PUBLIC_ENDPOINT_URL"),
 		MultipartTTL:            getDuration("MULTIPART_TTL", 7*24*time.Hour),
@@ -125,22 +80,10 @@ func Load() (Config, error) {
 		StreamBuffers:           getInt("STREAM_BUFFERS", 8),
 		ChunkTimeout:            getDuration("CHUNK_TIMEOUT", 30*time.Second),
 		StreamChunkSize:         getBytes("STREAM_CHUNK_SIZE", 4<<20),
-		TelegramTransport:       strings.ToLower(getenv("TELEGRAM_TRANSPORT", "bot")),
 		TelegramAppID:           getInt("TELEGRAM_APP_ID", 0),
 		TelegramAppHash:         os.Getenv("TELEGRAM_APP_HASH"),
 		TelegramPoolSize:        getInt("TELEGRAM_POOL_SIZE", 4),
 		TelegramUploadThreads:   getInt("TELEGRAM_UPLOAD_THREADS", 8),
-		MigrationRate:           getIntNonNeg("MIGRATION_RATE", 100),
-		MigrationWorkers:        getInt("MIGRATION_WORKERS", 4),
-		BotDeleteGrace:          getDuration("BOT_DELETE_GRACE", time.Hour),
-	}
-
-	// Soft-fallback to the pre-Phase-3 single-token env so a partial deploy
-	// (binary updated, env not yet) still boots in single-bot mode. The
-	// "production deploy note" in PHASES.md still asks operators to set
-	// the plural; this is a safety net, not a recommended steady state.
-	if len(cfg.TelegramBotTokens) == 0 && cfg.TelegramLegacyBotToken != "" {
-		cfg.TelegramBotTokens = []string{cfg.TelegramLegacyBotToken}
 	}
 
 	if cfg.AccessKeyID == "" {
@@ -150,36 +93,16 @@ func Load() (Config, error) {
 		return Config{}, errors.New("S3_SECRET_ACCESS_KEY is required")
 	}
 	if len(cfg.TelegramBotTokens) == 0 {
-		return Config{}, errors.New("TELEGRAM_BOT_TOKENS is required (comma-separated list; or set TELEGRAM_BOT_TOKEN for single-bot mode)")
+		return Config{}, errors.New("TELEGRAM_BOT_TOKENS is required (comma-separated list)")
 	}
 	if cfg.TelegramChatID == "" {
 		return Config{}, errors.New("TELEGRAM_CHAT_ID is required")
 	}
-
-	// Phase 4 validation. The transport flag must be one of the three known
-	// values — a typo silently routing to "bot" would mask a misconfigured
-	// migration. MTProto-using transports need app credentials from
-	// my.telegram.org; "bot" leaves them optional so the legacy single-
-	// transport deploy boots without them.
-	switch cfg.TelegramTransport {
-	case "bot", "dual", "mtproto":
-	default:
-		return Config{}, fmt.Errorf("TELEGRAM_TRANSPORT=%q not recognized (want bot, dual, or mtproto)", cfg.TelegramTransport)
+	if cfg.TelegramAppID <= 0 {
+		return Config{}, errors.New("TELEGRAM_APP_ID is required (register an app at my.telegram.org)")
 	}
-	if cfg.TelegramTransport != "bot" {
-		if cfg.TelegramAppID <= 0 {
-			return Config{}, errors.New("TELEGRAM_APP_ID is required when TELEGRAM_TRANSPORT != bot (register an app at my.telegram.org)")
-		}
-		if cfg.TelegramAppHash == "" {
-			return Config{}, errors.New("TELEGRAM_APP_HASH is required when TELEGRAM_TRANSPORT != bot")
-		}
-	}
-	// Clamp the grace window to a safe production minimum so a typo like
-	// `BOT_DELETE_GRACE=10s` doesn't quietly enable the read-during-swap
-	// race. The explicit 0 value bypasses the clamp because tests rely on
-	// it to drive the immediate-delete path.
-	if cfg.BotDeleteGrace > 0 && cfg.BotDeleteGrace < time.Minute {
-		cfg.BotDeleteGrace = time.Minute
+	if cfg.TelegramAppHash == "" {
+		return Config{}, errors.New("TELEGRAM_APP_HASH is required")
 	}
 
 	return cfg, nil
@@ -222,18 +145,6 @@ func getDuration(key string, fallback time.Duration) time.Duration {
 func getInt(key string, fallback int) int {
 	if value := os.Getenv(key); value != "" {
 		if n, err := strconv.Atoi(value); err == nil && n > 0 {
-			return n
-		}
-	}
-	return fallback
-}
-
-// getIntNonNeg is getInt's permissive cousin: it accepts 0 as a real value
-// (the "disable" sentinel for knobs like MIGRATION_RATE). A negative value
-// is still treated as invalid and falls back.
-func getIntNonNeg(key string, fallback int) int {
-	if value := os.Getenv(key); value != "" {
-		if n, err := strconv.Atoi(value); err == nil && n >= 0 {
 			return n
 		}
 	}

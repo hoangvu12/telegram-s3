@@ -3,20 +3,16 @@ package config
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
-// TestLoadPhase4Validation covers the Phase 4 transport / app-credential /
-// grace-window rules added to Load(). Earlier phases' config has been
-// implicitly covered by the higher-level test suites for years; this test
-// just guards the new failure modes so a typo in the transport flag or a
-// missing app credential fails fast at boot instead of mid-flight.
-func TestLoadPhase4Validation(t *testing.T) {
+func TestLoadRequiredFields(t *testing.T) {
 	base := map[string]string{
 		"S3_ACCESS_KEY_ID":     "k",
 		"S3_SECRET_ACCESS_KEY": "s",
 		"TELEGRAM_BOT_TOKENS":  "abc",
 		"TELEGRAM_CHAT_ID":     "-100",
+		"TELEGRAM_APP_ID":      "42",
+		"TELEGRAM_APP_HASH":    "deadbeef",
 	}
 
 	cases := []struct {
@@ -26,90 +22,46 @@ func TestLoadPhase4Validation(t *testing.T) {
 		check   func(t *testing.T, c Config)
 	}{
 		{
-			name: "default transport bot needs no app creds",
+			name: "all required env present",
 			env:  map[string]string{},
 			check: func(t *testing.T, c Config) {
-				if c.TelegramTransport != "bot" {
-					t.Fatalf("transport=%q want bot", c.TelegramTransport)
+				if c.TelegramAppID != 42 || c.TelegramAppHash != "deadbeef" {
+					t.Fatalf("app creds not parsed: %+v", c)
 				}
-				if c.MigrationRate != 100 {
-					t.Fatalf("migration_rate=%d want 100", c.MigrationRate)
-				}
-				if c.BotDeleteGrace != time.Hour {
-					t.Fatalf("grace=%v want 1h", c.BotDeleteGrace)
+				if len(c.TelegramBotTokens) != 1 || c.TelegramBotTokens[0] != "abc" {
+					t.Fatalf("tokens not parsed: %+v", c.TelegramBotTokens)
 				}
 			},
 		},
 		{
-			name:    "unknown transport rejected",
-			env:     map[string]string{"TELEGRAM_TRANSPORT": "BOTH"},
-			wantErr: "TELEGRAM_TRANSPORT",
+			name:    "missing TELEGRAM_BOT_TOKENS rejected",
+			env:     map[string]string{"TELEGRAM_BOT_TOKENS": ""},
+			wantErr: "TELEGRAM_BOT_TOKENS",
 		},
 		{
-			name:    "dual without app id rejected",
-			env:     map[string]string{"TELEGRAM_TRANSPORT": "dual"},
+			name:    "missing TELEGRAM_CHAT_ID rejected",
+			env:     map[string]string{"TELEGRAM_CHAT_ID": ""},
+			wantErr: "TELEGRAM_CHAT_ID",
+		},
+		{
+			name:    "missing TELEGRAM_APP_ID rejected",
+			env:     map[string]string{"TELEGRAM_APP_ID": ""},
 			wantErr: "TELEGRAM_APP_ID",
 		},
 		{
-			name: "dual without app hash rejected",
-			env: map[string]string{
-				"TELEGRAM_TRANSPORT": "dual",
-				"TELEGRAM_APP_ID":    "42",
-			},
+			name:    "missing TELEGRAM_APP_HASH rejected",
+			env:     map[string]string{"TELEGRAM_APP_HASH": ""},
 			wantErr: "TELEGRAM_APP_HASH",
 		},
 		{
-			name: "dual with creds parses",
-			env: map[string]string{
-				"TELEGRAM_TRANSPORT": "dual",
-				"TELEGRAM_APP_ID":    "42",
-				"TELEGRAM_APP_HASH":  "deadbeef",
-			},
+			name: "comma-separated tokens parsed",
+			env:  map[string]string{"TELEGRAM_BOT_TOKENS": "a, b ,c"},
 			check: func(t *testing.T, c Config) {
-				if c.TelegramTransport != "dual" || c.TelegramAppID != 42 || c.TelegramAppHash != "deadbeef" {
-					t.Fatalf("dual creds not parsed: %+v", c)
-				}
-			},
-		},
-		{
-			name: "MIGRATION_RATE=0 disables sweeper (not rejected)",
-			env: map[string]string{
-				"TELEGRAM_TRANSPORT": "dual",
-				"TELEGRAM_APP_ID":    "42",
-				"TELEGRAM_APP_HASH":  "x",
-				"MIGRATION_RATE":     "0",
-			},
-			check: func(t *testing.T, c Config) {
-				if c.MigrationRate != 0 {
-					t.Fatalf("migration_rate=%d want 0", c.MigrationRate)
-				}
-			},
-		},
-		{
-			name: "BOT_DELETE_GRACE below 1m clamps to 1m",
-			env: map[string]string{
-				"TELEGRAM_TRANSPORT": "dual",
-				"TELEGRAM_APP_ID":    "42",
-				"TELEGRAM_APP_HASH":  "x",
-				"BOT_DELETE_GRACE":   "10s",
-			},
-			check: func(t *testing.T, c Config) {
-				if c.BotDeleteGrace != time.Minute {
-					t.Fatalf("grace=%v want 1m (clamp)", c.BotDeleteGrace)
-				}
-			},
-		},
-		{
-			name: "BOT_DELETE_GRACE=0 preserved (test-only path)",
-			env: map[string]string{
-				"TELEGRAM_TRANSPORT": "dual",
-				"TELEGRAM_APP_ID":    "42",
-				"TELEGRAM_APP_HASH":  "x",
-				"BOT_DELETE_GRACE":   "0s",
-			},
-			check: func(t *testing.T, c Config) {
-				if c.BotDeleteGrace != 0 {
-					t.Fatalf("grace=%v want 0 (explicit test bypass)", c.BotDeleteGrace)
+				if len(c.TelegramBotTokens) != 3 ||
+					c.TelegramBotTokens[0] != "a" ||
+					c.TelegramBotTokens[1] != "b" ||
+					c.TelegramBotTokens[2] != "c" {
+					t.Fatalf("tokens=%v want [a b c]", c.TelegramBotTokens)
 				}
 			},
 		},

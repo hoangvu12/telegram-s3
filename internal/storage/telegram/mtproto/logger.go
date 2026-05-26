@@ -1,10 +1,9 @@
-// Package mtproto implements the Telegram MTProto Backend (Phase 4). It
-// runs alongside BotStorage during the dual-transport migration window
-// and eventually replaces it for all new uploads. The package is split
-// across logger.go (zap→slog bridge so gotd logs land in the gateway's
-// slog handler), session.go (SQLite-backed session.Storage), client.go
-// (one MTProtoBot per token, lifecycle + cached *tg.InputChannel),
-// upload.go / download.go / delete.go (Backend impls).
+// Package mtproto implements the Telegram MTProto Backend. The
+// package is split across logger.go (zap→slog bridge so gotd logs
+// land in the gateway's slog handler), session.go (SQLite-backed
+// session.Storage), client.go (one MTProtoBot per token, lifecycle +
+// cached *tg.InputChannel), upload.go / download.go / delete.go
+// (Backend impls).
 package mtproto
 
 import (

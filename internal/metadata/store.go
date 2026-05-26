@@ -52,11 +52,9 @@ type Object struct {
 // Chunk mirrors storage.Chunk for persistence (the layers stay decoupled; the
 // handler converts between them, as it already does for Object).
 //
-// Transport and BotIndex are persisted on the chunk row (Phase 3 schema
-// additions). Pre-Phase-3 rows backfilled at migration time read as
-// Transport="bot", BotIndex=0. The dispatcher treats Transport == "" as
-// "bot" so the absent-column case (e.g. a fresh test DB hand-rolled
-// without the column) still routes through BotStorage.
+// Transport and BotIndex are persisted on the chunk row; the column
+// is retained for schema compatibility but only one value is in use
+// post-migration.
 type Chunk struct {
 	Seq       int
 	FileID    string
@@ -205,11 +203,10 @@ CREATE TABLE IF NOT EXISTS tg_sessions (
   updated_at TEXT NOT NULL
 );
 
--- Phase 4: grace-delete buffer for the migration sweeper. After
--- pass-1 atomically swaps a bot chunk to mtproto, the old (message_id,
--- bot_index) lands here; pass-2 reaps it once cfg.BotDeleteGrace has
--- passed. See PHASES.md decision #14 for why the bot delete cannot
--- be done in the same tx as the row swap.
+-- Phase 4 sweeper grace-delete buffer. The migration sweeper was
+-- removed in Phase 5; the table is retained (additive-only schema
+-- invariant) and holds dormant zombie rows from the original drain.
+-- No code path reads or writes it now.
 CREATE TABLE IF NOT EXISTS bot_chunks_pending_delete (
   message_id INTEGER NOT NULL,
   bot_index INTEGER NOT NULL,
@@ -941,217 +938,6 @@ INSERT INTO tg_sessions(key, value, updated_at) VALUES(?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
 `, key, data, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
-}
-
-// --- Phase 4: migration sweeper helpers ------------------------------------
-
-// BotChunkLoc identifies one Bot-API chunk that the sweeper considers
-// for migration to MTProto. The sweeper downloads via BotStorage using
-// (FileID, MessageID, BotIndex) and then re-uploads, swapping the row
-// via SwapBotChunkToMtproto.
-type BotChunkLoc struct {
-	Bucket    string
-	Key       string
-	PartSeq   int
-	Offset    int64
-	Size      int64
-	FileID    string
-	MessageID int64
-	BotIndex  int
-}
-
-// ListBotChunksOldestFirst returns up to `limit` object_chunks rows
-// with transport='bot', sorted by the parent object's updated_at
-// ascending — so the oldest data drains first. The join is cheap
-// because (bucket, key) is the object_chunks primary key prefix.
-func (s *Store) ListBotChunksOldestFirst(ctx context.Context, limit int) ([]BotChunkLoc, error) {
-	rows, err := s.read.QueryContext(ctx, `
-SELECT oc.bucket, oc.key, oc.part_seq, oc.offset, oc.size,
-       oc.telegram_file_id, oc.telegram_message_id, oc.bot_index
-FROM object_chunks oc
-JOIN objects o ON o.bucket = oc.bucket AND o.key = oc.key
-WHERE oc.transport = 'bot' AND o.deleted_at IS NULL
-ORDER BY o.updated_at ASC, oc.bucket ASC, oc.key ASC, oc.part_seq ASC
-LIMIT ?
-`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []BotChunkLoc
-	for rows.Next() {
-		var c BotChunkLoc
-		if err := rows.Scan(&c.Bucket, &c.Key, &c.PartSeq, &c.Offset, &c.Size, &c.FileID, &c.MessageID, &c.BotIndex); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
-// SwapBotChunkToMtproto is the load-bearing pass-1 atomic op of the
-// sweeper. In one transaction it (a) updates the chunk row to point at
-// the freshly-uploaded MTProto message, and (b) records the old bot
-// (message_id, bot_index) in bot_chunks_pending_delete so pass-2 can
-// reap it after the grace window. The two writes MUST share a tx — a
-// crash between them either leaves the bot message readable
-// indefinitely (if only the insert ran) or breaks reads (if only the
-// update ran). Both are correctness violations.
-//
-// The pre-update guard `WHERE part_seq=? AND transport='bot'` makes
-// double-application a no-op: a second invocation finds the row
-// already mtproto and silently affects 0 rows (the duplicate insert
-// is then a unique-key conflict, which we ignore — see ON CONFLICT).
-func (s *Store) SwapBotChunkToMtproto(ctx context.Context, bucket, key string, partSeq int, oldMessageID int64, oldBotIndex int, newMessageID int64, newBotIndex int, swappedAt time.Time) error {
-	tx, err := s.write.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `
-UPDATE object_chunks
-   SET transport = 'mtproto',
-       telegram_message_id = ?,
-       bot_index = ?,
-       telegram_file_id = ''
- WHERE bucket = ? AND key = ? AND part_seq = ? AND transport = 'bot'
-`, newMessageID, newBotIndex, bucket, key, partSeq)
-	if err != nil {
-		return err
-	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		// Another pass-1 already migrated this row, or the parent object was
-		// deleted underneath us. Either way pass-2 has nothing new to do; we
-		// also do NOT insert into pending_delete because the old bot message
-		// was already enqueued (or already reaped).
-		return tx.Commit()
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO bot_chunks_pending_delete(message_id, bot_index, swapped_at)
-VALUES(?, ?, ?)
-ON CONFLICT(message_id, bot_index) DO UPDATE SET swapped_at = excluded.swapped_at
-`, oldMessageID, oldBotIndex, swappedAt.UTC().Format(time.RFC3339Nano)); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// PendingDelete is one row from bot_chunks_pending_delete — the
-// sweeper's pass-2 reaps these after swapped_at + cfg.BotDeleteGrace.
-type PendingDelete struct {
-	MessageID int64
-	BotIndex  int
-	SwappedAt time.Time
-}
-
-// PendingDeletesOlderThan returns up to `limit` pending-delete rows
-// whose swapped_at is strictly before `before`. Ordered oldest-first
-// so a tight rate cap drains the worst backlog first.
-func (s *Store) PendingDeletesOlderThan(ctx context.Context, before time.Time, limit int) ([]PendingDelete, error) {
-	rows, err := s.read.QueryContext(ctx, `
-SELECT message_id, bot_index, swapped_at
-FROM bot_chunks_pending_delete
-WHERE swapped_at < ?
-ORDER BY swapped_at ASC
-LIMIT ?
-`, before.UTC().Format(time.RFC3339Nano), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []PendingDelete
-	for rows.Next() {
-		var p PendingDelete
-		var swapped string
-		if err := rows.Scan(&p.MessageID, &p.BotIndex, &swapped); err != nil {
-			return nil, err
-		}
-		p.SwappedAt, _ = time.Parse(time.RFC3339Nano, swapped)
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-// DeletePendingDelete removes one pending-delete row after the
-// sweeper's pass-2 has successfully deleted the bot message. A
-// failure here is harmless — the row stays and the next pass-2 tries
-// the bot delete again (Telegram's deleteMessage is idempotent on a
-// message that's already gone).
-func (s *Store) DeletePendingDelete(ctx context.Context, messageID int64, botIndex int) error {
-	_, err := s.write.ExecContext(ctx, `
-DELETE FROM bot_chunks_pending_delete WHERE message_id = ? AND bot_index = ?
-`, messageID, botIndex)
-	return err
-}
-
-// CountBotChunks returns the number of object_chunks rows still on
-// the Bot HTTP API transport. Exposed for ops/observability: when this
-// hits zero the sweeper has drained, and the operator can flip
-// TELEGRAM_TRANSPORT to "mtproto" and eventually delete the legacy bot.
-func (s *Store) CountBotChunks(ctx context.Context) (int64, error) {
-	var n int64
-	err := s.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_chunks WHERE transport = 'bot'`).Scan(&n)
-	return n, err
-}
-
-// BotMigrationSnapshot is a point-in-time picture of the Phase 4
-// sweeper's remaining work. The sweeper logs this at startup and once
-// per tick so operators can read drain progress directly from the
-// service logs — important because the production deploy's SQLite DB
-// lives inside an Easypanel container that the easypanel-skill tRPC
-// API can't reach (terminal is a separate WebSocket).
-type BotMigrationSnapshot struct {
-	// BotChunksRemaining is the count of object_chunks rows still
-	// addressed via the Bot HTTP API. Drops by ~MigrationRate/day.
-	// Item-5-ready when this hits 0.
-	BotChunksRemaining int64
-	// PendingDeletes is the size of the bot_chunks_pending_delete
-	// queue — pass-1 enqueues here, pass-2 reaps after the grace
-	// window. Hovers near MigrationRate × grace / 24h in steady state.
-	PendingDeletes int64
-	// LatestSwap is the newest swapped_at across pending_delete rows.
-	// The IsZero check on the value tells the caller whether the
-	// table was empty (no swaps yet) vs. had data — we don't surface
-	// sql.NullTime to keep the struct boring to log.
-	LatestSwap time.Time
-}
-
-// BotMigrationSnapshot reads the three drain-progress counts in a
-// single read-pool round trip (one COUNT on object_chunks, one
-// combined COUNT + MAX on bot_chunks_pending_delete). Safe to call on
-// every sweeper tick — at the default MigrationRate=100/day this
-// fires ~96 times/day, well under any meaningful SQLite contention.
-func (s *Store) BotMigrationSnapshot(ctx context.Context) (BotMigrationSnapshot, error) {
-	var snap BotMigrationSnapshot
-	if err := s.read.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM object_chunks WHERE transport = 'bot'`,
-	).Scan(&snap.BotChunksRemaining); err != nil {
-		return snap, fmt.Errorf("count bot chunks: %w", err)
-	}
-	// MAX(swapped_at) is NULL on an empty table; sql.NullString catches
-	// that. The column is stored as an RFC3339Nano string (see
-	// SwapBotChunkToMtproto), so we Scan into a string and parse — the
-	// driver doesn't auto-convert text to time.Time. Same pattern as
-	// PendingDeletesOlderThan. Combining COUNT + MAX in one row keeps
-	// the snapshot to two read-pool round trips total.
-	var latest sql.NullString
-	if err := s.read.QueryRowContext(ctx,
-		`SELECT COUNT(*), MAX(swapped_at) FROM bot_chunks_pending_delete`,
-	).Scan(&snap.PendingDeletes, &latest); err != nil {
-		return snap, fmt.Errorf("count pending deletes: %w", err)
-	}
-	if latest.Valid {
-		// Parse failures leave LatestSwap zero — that's the same fallback
-		// the logger uses for "no rows yet", so an unparseable timestamp
-		// degrades to "we have rows but no readable max" rather than a
-		// confusing year-0 line in the log. Production rows are always
-		// written via SwapBotChunkToMtproto's RFC3339Nano formatter, so
-		// the parse should not fail.
-		snap.LatestSwap, _ = time.Parse(time.RFC3339Nano, latest.String)
-	}
-	return snap, nil
 }
 
 func deleteMultipartTx(ctx context.Context, tx *sql.Tx, uploadID string) error {

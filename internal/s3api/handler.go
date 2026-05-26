@@ -339,19 +339,14 @@ func toMetaChunks(chunks []storage.Chunk) []metadata.Chunk {
 }
 
 // chunkRefs converts a metadata.Chunk slice into the ChunkRef slice the
-// Backend interface consumes. Transport defaults to "bot" for pre-Phase-3
-// rows that were stored before the column existed.
+// Backend interface consumes.
 func chunkRefs(chunks []metadata.Chunk) []storage.ChunkRef {
 	if len(chunks) == 0 {
 		return nil
 	}
 	refs := make([]storage.ChunkRef, len(chunks))
 	for i, c := range chunks {
-		t := c.Transport
-		if t == "" {
-			t = storage.TransportBot
-		}
-		refs[i] = storage.ChunkRef{Transport: t, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+		refs[i] = storage.ChunkRef{Transport: c.Transport, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
 	}
 	return refs
 }
@@ -364,11 +359,7 @@ func storageChunkRefs(chunks []storage.Chunk) []storage.ChunkRef {
 	}
 	refs := make([]storage.ChunkRef, len(chunks))
 	for i, c := range chunks {
-		t := c.Transport
-		if t == "" {
-			t = storage.TransportBot
-		}
-		refs[i] = storage.ChunkRef{Transport: t, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+		refs[i] = storage.ChunkRef{Transport: c.Transport, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
 	}
 	return refs
 }
@@ -478,14 +469,9 @@ func (h *Handler) planRead(obj metadata.Object, chunks []metadata.Chunk, rng *ht
 	return locs, start, end
 }
 
-// metaChunkRef builds a ChunkRef from a single metadata.Chunk row, applying
-// the Transport-defaults-to-"bot" rule for legacy rows.
+// metaChunkRef builds a ChunkRef from a single metadata.Chunk row.
 func metaChunkRef(c metadata.Chunk) storage.ChunkRef {
-	t := c.Transport
-	if t == "" {
-		t = storage.TransportBot
-	}
-	return storage.ChunkRef{Transport: t, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+	return storage.ChunkRef{Transport: c.Transport, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
 }
 
 // newPrefetchReader constructs a parallel-prefetch reader over the given

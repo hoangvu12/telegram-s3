@@ -2,12 +2,10 @@ package mtproto
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/gotd/td/tg"
 
 	"telegram-s3/internal/storage"
-	parent "telegram-s3/internal/storage/telegram"
 )
 
 // deleteBatchSize is the upper bound Telegram accepts in a single
@@ -21,21 +19,12 @@ func (s *Storage) Delete(ctx context.Context, ref storage.ChunkRef) error {
 	return s.DeleteBatch(ctx, []storage.ChunkRef{ref})
 }
 
-// DeleteBatch groups refs by bot (any bot in the same channel can
-// delete any message, but routing through the writer matches the
-// BotStorage contract and keeps "which bot deleted what" debuggable)
-// and issues channels.deleteMessages batched at 100 IDs/call.
-//
-// A non-mtproto ref is a programming bug — the dispatcher should
-// have routed it to BotStorage. We surface as an error so a stray
-// ref doesn't get silently dropped.
-//
-// Returns the first error encountered; subsequent failures are
-// logged. The Bot HTTP API contract documented on BotStorage's
-// DeleteBatch is: "best-effort cleanup, surface the first error,
-// keep going." MTProto's batched path follows the same contract so
-// callers (multipart abort, reap-superseded-chunks) don't need to
-// switch on transport.
+// DeleteBatch groups refs by bot (routing through the writer keeps
+// "which bot deleted what" debuggable) and issues
+// channels.deleteMessages batched at 100 IDs/call. Returns the first
+// error encountered; subsequent failures are logged. Callers
+// (multipart abort, reap-superseded-chunks) treat this as best-effort
+// cleanup.
 func (s *Storage) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) error {
 	if len(refs) == 0 {
 		return nil
@@ -48,22 +37,12 @@ func (s *Storage) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) erro
 
 	var firstErr error
 	for _, ref := range refs {
-		if ref.Transport != storage.TransportMTProto {
-			err := fmt.Errorf("mtproto: DeleteBatch got non-mtproto ref (transport=%q)", ref.Transport)
-			if firstErr == nil {
-				firstErr = err
-			}
-			if s.logger != nil {
-				s.logger.Warn("mtproto delete skipped (wrong transport)", "msg_id", ref.MessageID, "transport", ref.Transport)
-			}
-			continue
-		}
 		bot := s.pool.At(ref.BotIndex)
 		if bot == nil {
 			// Pool shrunk — route to any pool member. Under MTProto delete
 			// is bot-agnostic (channel admin permission, not message
 			// ownership), so any in-pool bot suffices.
-			_, bot = s.pool.Pick(parent.BotOpStream) // op irrelevant for deletes; reuse stream counter
+			_, bot = s.pool.Pick(BotOpStream) // op irrelevant for deletes; reuse stream counter
 		}
 		b := byBot[bot.Index()]
 		if b == nil {

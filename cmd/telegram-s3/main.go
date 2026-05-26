@@ -11,13 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"telegram-s3/internal/cache"
 	"telegram-s3/internal/config"
 	"telegram-s3/internal/metadata"
-	"telegram-s3/internal/migrate"
 	"telegram-s3/internal/s3api"
-	"telegram-s3/internal/storage"
-	"telegram-s3/internal/storage/telegram"
 	"telegram-s3/internal/storage/telegram/mtproto"
 )
 
@@ -37,70 +33,30 @@ func main() {
 	}
 	defer store.Close()
 
-	// Bot API file_path cache: getFile becomes a per-fileID one-shot
-	// instead of per-chunk-read. Generic by shape so Phase 4 reuses
-	// the type for (messageID, botIndex) → InputDocumentFileLocation.
-	pathCache := cache.New[string, string](cfg.LocationCacheTTL, 0)
-	defer pathCache.Close()
-
-	botBackend := telegram.NewBotStorageWithOptions(
-		cfg.TelegramBotTokens,
-		cfg.TelegramChatID,
-		cfg.TelegramAPIBaseURL,
-		cfg.HTTPMaxIdleConnsPerHost,
-		int(cfg.TelegramMaxChunkSize),
-		pathCache,
-		logger,
-	)
-
-	// Phase 4 — optionally bring up MTProto. Mode "bot" (the default)
-	// keeps the binary's behavior identical to pre-Phase-4: no gotd
-	// boot, no extra connections, no app creds required. Modes "dual"
-	// and "mtproto" require app credentials + a successful handshake
-	// for every bot in the pool before serving.
-	var (
-		mtStorage   *mtproto.Storage
-		mtPool      *mtproto.Pool
-		sweeper     *migrate.Sweeper
-		dispatcher  *storage.Dispatcher
-		mtprotoMode = storage.TransportMode(cfg.TelegramTransport)
-	)
-
-	if mtprotoMode != storage.TransportModeBot {
-		channelID, err := mtproto.ParseChannelID(cfg.TelegramChatID)
-		if err != nil {
-			logger.Error("parse channel id for mtproto", "error", err)
-			os.Exit(1)
-		}
-		mtPool, err = startMTProtoPool(context.Background(), cfg, store, channelID, logger)
-		if err != nil {
-			logger.Error("start mtproto pool", "error", err)
-			os.Exit(1)
-		}
-		mtStorage, err = mtproto.NewStorage(mtproto.Options{
-			Pool:          mtPool,
-			ChunkSize:     int(cfg.TelegramMaxChunkSize),
-			UploadThreads: cfg.TelegramUploadThreads,
-			Logger:        logger,
-		})
-		if err != nil {
-			mtPool.Close()
-			logger.Error("init mtproto storage", "error", err)
-			os.Exit(1)
-		}
-		defer mtStorage.Close()
-	}
-
-	dispatcher, err = storage.NewDispatcher(mtprotoMode, botBackend, mtStorage)
+	channelID, err := mtproto.ParseChannelID(cfg.TelegramChatID)
 	if err != nil {
-		if mtPool != nil {
-			mtPool.Close()
-		}
-		logger.Error("init dispatcher", "error", err)
+		logger.Error("parse channel id", "error", err)
 		os.Exit(1)
 	}
+	mtPool, err := startMTProtoPool(context.Background(), cfg, store, channelID, logger)
+	if err != nil {
+		logger.Error("start mtproto pool", "error", err)
+		os.Exit(1)
+	}
+	mtStorage, err := mtproto.NewStorage(mtproto.Options{
+		Pool:          mtPool,
+		ChunkSize:     int(cfg.TelegramMaxChunkSize),
+		UploadThreads: cfg.TelegramUploadThreads,
+		Logger:        logger,
+	})
+	if err != nil {
+		mtPool.Close()
+		logger.Error("init mtproto storage", "error", err)
+		os.Exit(1)
+	}
+	defer mtStorage.Close()
 
-	handler := s3api.NewHandler(cfg, store, dispatcher, logger)
+	handler := s3api.NewHandler(cfg, store, mtStorage, logger)
 
 	// Abandoned-multipart janitor (P8.6). Skipped if the sweep is disabled
 	// (interval <= 0). Stops with the server on SIGINT/SIGTERM.
@@ -108,28 +64,6 @@ func main() {
 	defer cancelJanitor()
 	if cfg.MultipartSweepInterval > 0 {
 		go handler.RunMultipartJanitor(janitorCtx, cfg.MultipartSweepInterval, cfg.MultipartTTL)
-	}
-
-	// Phase 4 sweeper — dual mode runs the background migration that
-	// drains transport='bot' rows. mtproto-only mode keeps the sweeper
-	// alive too: any pending_delete rows that pass-1 wrote in a prior
-	// dual-mode deploy still need to drain through pass-2.
-	if mtStorage != nil {
-		sw, err := migrate.NewSweeper(migrate.Options{
-			Store:          store,
-			Bot:            botBackend,
-			MTProto:        mtStorage,
-			MigrationRate:  pickMigrationRate(cfg),
-			BotDeleteGrace: cfg.BotDeleteGrace,
-			Workers:        cfg.MigrationWorkers,
-			Logger:         logger,
-		})
-		if err != nil {
-			logger.Error("init sweeper", "error", err)
-			os.Exit(1)
-		}
-		sweeper = sw
-		go sweeper.Run(janitorCtx)
 	}
 
 	server := &http.Server{
@@ -141,7 +75,6 @@ func main() {
 	go func() {
 		logger.Info("server listening",
 			"addr", cfg.ListenAddr,
-			"transport", cfg.TelegramTransport,
 			"bots", len(cfg.TelegramBotTokens),
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -160,9 +93,7 @@ func main() {
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("shutdown failed", "error", err)
 	}
-	if mtPool != nil {
-		mtPool.Close()
-	}
+	mtPool.Close()
 }
 
 // startMTProtoPool brings up every bot in parallel. Each StartBot
@@ -211,16 +142,4 @@ func startMTProtoPool(ctx context.Context, cfg config.Config, store *metadata.St
 		}
 	}
 	return mtproto.NewPool(bots)
-}
-
-// pickMigrationRate gives the sweeper its rate budget. The user may
-// set 0 to disable pass-1 (e.g. during a deploy where they want to
-// pause migration to investigate a failure pattern), in which case
-// pass-2 still runs to drain any pending_delete rows pass-1 wrote
-// before the pause.
-func pickMigrationRate(cfg config.Config) int {
-	if cfg.MigrationRate < 0 {
-		return 0
-	}
-	return cfg.MigrationRate
 }

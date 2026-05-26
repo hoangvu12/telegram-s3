@@ -18,7 +18,15 @@ import (
 	"golang.org/x/time/rate"
 
 	"telegram-s3/internal/metadata"
-	parent "telegram-s3/internal/storage/telegram"
+)
+
+// BotOp selects which round-robin counter Pool.Pick advances. Two
+// counters prevent an upload burst from starving range reads.
+type BotOp string
+
+const (
+	BotOpStream BotOp = "stream"
+	BotOpUpload BotOp = "upload"
 )
 
 // supergroupPrefix is the Bot-API encoding for channel chat IDs:
@@ -349,13 +357,11 @@ func resolveChannel(ctx context.Context, api *tg.Client, channelID int64) (*tg.I
 
 // --- Pool ------------------------------------------------------------------
 
-// Pool round-robins MTProto bots the same way parent.BotPool does for
-// Bot API tokens — two independent counters (stream/upload) so a burst
-// of one op type doesn't starve the other. Pick's returned index is
-// what gets persisted in Chunk.BotIndex; later reads target the same
-// bot via At so the dispatcher can pin reads to the writer (MTProto's
-// access hashes are bot-agnostic, but pinning keeps debugging sane and
-// matches the BotStorage contract).
+// Pool round-robins MTProto bots with two independent counters
+// (stream/upload) so a burst of one op type doesn't starve the other.
+// Pick's returned index is persisted in Chunk.BotIndex; later reads
+// target the same bot via At. Access hashes are bot-agnostic, but
+// pinning keeps debugging sane.
 type Pool struct {
 	bots      []*MTProtoBot
 	streamIdx atomic.Int64
@@ -373,11 +379,11 @@ func NewPool(bots []*MTProtoBot) (*Pool, error) {
 }
 
 // Pick advances the appropriate counter and returns the next bot
-// + its index. Mirror of parent.BotPool.Pick.
-func (p *Pool) Pick(op parent.BotOp) (int, *MTProtoBot) {
+// + its index.
+func (p *Pool) Pick(op BotOp) (int, *MTProtoBot) {
 	var next int64
 	switch op {
-	case parent.BotOpUpload:
+	case BotOpUpload:
 		next = p.uploadIdx.Add(1) - 1
 	default:
 		next = p.streamIdx.Add(1) - 1

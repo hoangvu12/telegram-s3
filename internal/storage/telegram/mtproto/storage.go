@@ -20,24 +20,16 @@ import (
 const uploadPartSize = 512 * 1024
 
 // docLocationKey identifies one cached *tg.InputDocumentFileLocation.
-// (MessageID, BotIndex) is the chunk identity under MTProto — file_ids
-// are bot-bound under the Bot HTTP API but message_ids are bot-agnostic
-// under MTProto, so any pool member can resolve a foreign bot's message
+// (MessageID, BotIndex) is the chunk identity; message_ids are
+// bot-agnostic so any pool member can resolve a foreign bot's message
 // (the BotIndex here is the writer hint, not a lookup constraint).
 type docLocationKey struct {
 	MessageID int64
 	BotIndex  int
 }
 
-// Storage is the MTProto Backend (Phase 4). It is the destination
-// state of the migration — once every transport='bot' row has drained
-// the dispatcher's "bot" branch becomes unreachable and BotStorage can
-// be deleted from the binary.
-//
-// The pool's split counters (stream/upload) mirror parent.BotPool so
-// the two backends behave symmetrically: a burst of one op type
-// doesn't starve the other. The locCache turns repeated reads of a
-// single chunk into one channels.GetMessages plus N UploadGetFile
+// Storage is the MTProto Backend. The locCache turns repeated reads
+// of a single chunk into one channels.GetMessages plus N UploadGetFile
 // calls — without it the file_reference resolve cost dominates the
 // hot path.
 type Storage struct {
@@ -56,9 +48,9 @@ type Storage struct {
 // Options bundles MTProto Storage construction. The chat/channel
 // resolution is per-bot (each bot has its own access hash), so the
 // channel pointer lives on MTProtoBot, not here. ChunkSize defaults
-// to 18 MiB — same as BotStorage — so the migration sweeper produces
-// chunks the same shape as the bot chunks it replaces, and the
-// prefetch reader's window stays meaningful.
+// to 18 MiB so chunked objects stay the same shape across the
+// pre/post-migration boundary and the prefetch reader's window stays
+// meaningful.
 type Options struct {
 	Pool          *Pool
 	ChunkSize     int // bytes; defaults to 18 MiB
@@ -105,17 +97,13 @@ func (s *Storage) Close() {
 	}
 }
 
-// Pool exposes the underlying bot pool for callers (the dispatcher /
-// sweeper) that need to coordinate transport selection with bot
-// affinity.
+// Pool exposes the underlying bot pool for callers that need to
+// coordinate with bot affinity.
 func (s *Storage) Pool() *Pool { return s.pool }
 
-// chunkFilename is a near-copy of the bot package's helper so the
-// MTProto chunk naming matches: object-key for seq 0, "<key>.partN"
-// for subsequent chunks. Telegram preserves filenames on download, so
-// keeping the convention identical means a chunk migrated from bot to
-// MTProto stays nameable the same way (useful for debugging via the
-// Telegram client UI).
+// chunkFilename produces the per-chunk Telegram filename: object key
+// for seq 0, "<key>.partN" for subsequent chunks. Telegram preserves
+// the filename on download, useful for debugging via the client UI.
 func chunkFilename(name string, seq int) string {
 	base := safeFilename(name)
 	if seq == 0 {
