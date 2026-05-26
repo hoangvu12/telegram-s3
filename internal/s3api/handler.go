@@ -339,21 +339,9 @@ func toMetaChunks(chunks []storage.Chunk) []metadata.Chunk {
 }
 
 // chunkRefs converts a metadata.Chunk slice into the ChunkRef slice the
-// Backend interface consumes.
+// Backend interface consumes. Failed-put cleanup feeds storage.Chunk values
+// through toMetaChunks first, so there's a single conversion path.
 func chunkRefs(chunks []metadata.Chunk) []storage.ChunkRef {
-	if len(chunks) == 0 {
-		return nil
-	}
-	refs := make([]storage.ChunkRef, len(chunks))
-	for i, c := range chunks {
-		refs[i] = storage.ChunkRef{Transport: c.Transport, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
-	}
-	return refs
-}
-
-// storageChunkRefs is the same conversion for a freshly-uploaded
-// storage.Chunk slice (so failed-put cleanup and DeleteBatch share one path).
-func storageChunkRefs(chunks []storage.Chunk) []storage.ChunkRef {
 	if len(chunks) == 0 {
 		return nil
 	}
@@ -367,7 +355,7 @@ func storageChunkRefs(chunks []storage.Chunk) []storage.ChunkRef {
 // deleteChunks best-effort removes the Telegram messages for chunks that were
 // uploaded but whose object was then rejected/failed to persist.
 func (h *Handler) deleteChunks(ctx context.Context, chunks []storage.Chunk) {
-	refs := storageChunkRefs(chunks)
+	refs := chunkRefs(toMetaChunks(chunks))
 	if len(refs) == 0 {
 		return
 	}

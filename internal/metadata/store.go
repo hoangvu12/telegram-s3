@@ -393,35 +393,11 @@ func (s *Store) PutObject(ctx context.Context, obj Object, chunks []Chunk) error
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO objects(bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at, deleted_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-ON CONFLICT(bucket, key) DO UPDATE SET
-  size = excluded.size,
-  etag = excluded.etag,
-  content_type = excluded.content_type,
-  telegram_file_id = excluded.telegram_file_id,
-  telegram_message_id = excluded.telegram_message_id,
-  updated_at = excluded.updated_at,
-  deleted_at = NULL
-`, obj.Bucket, obj.Key, obj.Size, obj.ETag, obj.ContentType, obj.TelegramFileID, obj.TelegramMessageID, obj.CreatedAt.Format(time.RFC3339Nano), obj.UpdatedAt.Format(time.RFC3339Nano)); err != nil {
+	if err := upsertObjectRowTx(ctx, tx, obj); err != nil {
 		return err
 	}
-
-	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, obj.Bucket, obj.Key); err != nil {
+	if err := replaceObjectChunksTx(ctx, tx, obj.Bucket, obj.Key, chunks); err != nil {
 		return err
-	}
-	for _, c := range chunks {
-		transport := c.Transport
-		if transport == "" {
-			transport = "bot"
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, obj.Bucket, obj.Key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset, transport, c.BotIndex); err != nil {
-			return err
-		}
 	}
 	if err := replaceObjectMetadataTx(ctx, tx, obj.Bucket, obj.Key, obj.Metadata); err != nil {
 		return err
@@ -838,28 +814,11 @@ func (s *Store) FinalizeMultipartUpload(ctx context.Context, obj Object, chunks 
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO objects(bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at, deleted_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-ON CONFLICT(bucket, key) DO UPDATE SET
-  size = excluded.size, etag = excluded.etag, content_type = excluded.content_type,
-  telegram_file_id = excluded.telegram_file_id, telegram_message_id = excluded.telegram_message_id,
-  updated_at = excluded.updated_at, deleted_at = NULL
-`, obj.Bucket, obj.Key, obj.Size, obj.ETag, obj.ContentType, obj.TelegramFileID, obj.TelegramMessageID, obj.CreatedAt.Format(time.RFC3339Nano), obj.UpdatedAt.Format(time.RFC3339Nano)); err != nil {
+	if err := upsertObjectRowTx(ctx, tx, obj); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, obj.Bucket, obj.Key); err != nil {
+	if err := replaceObjectChunksTx(ctx, tx, obj.Bucket, obj.Key, chunks); err != nil {
 		return err
-	}
-	for _, c := range chunks {
-		transport := c.Transport
-		if transport == "" {
-			transport = "bot"
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			obj.Bucket, obj.Key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset, transport, c.BotIndex); err != nil {
-			return err
-		}
 	}
 	if err := replaceObjectMetadataTx(ctx, tx, obj.Bucket, obj.Key, obj.Metadata); err != nil {
 		return err
@@ -868,6 +827,41 @@ ON CONFLICT(bucket, key) DO UPDATE SET
 		return err
 	}
 	return tx.Commit()
+}
+
+// upsertObjectRowTx writes the objects row (INSERT … ON CONFLICT DO UPDATE
+// clearing deleted_at). The chunk map and metadata are replaced separately by
+// the caller so both PutObject and FinalizeMultipartUpload share this body.
+func upsertObjectRowTx(ctx context.Context, tx *sql.Tx, obj Object) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO objects(bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at, deleted_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+ON CONFLICT(bucket, key) DO UPDATE SET
+  size = excluded.size, etag = excluded.etag, content_type = excluded.content_type,
+  telegram_file_id = excluded.telegram_file_id, telegram_message_id = excluded.telegram_message_id,
+  updated_at = excluded.updated_at, deleted_at = NULL
+`, obj.Bucket, obj.Key, obj.Size, obj.ETag, obj.ContentType, obj.TelegramFileID, obj.TelegramMessageID, obj.CreatedAt.Format(time.RFC3339Nano), obj.UpdatedAt.Format(time.RFC3339Nano))
+	return err
+}
+
+// replaceObjectChunksTx wipes and rewrites the chunk map for one object. An
+// empty transport string defaults to "bot" so a pre-Phase-3 caller that didn't
+// set the column still produces a valid row.
+func replaceObjectChunksTx(ctx context.Context, tx *sql.Tx, bucket, key string, chunks []Chunk) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
+		return err
+	}
+	for _, c := range chunks {
+		transport := c.Transport
+		if transport == "" {
+			transport = "bot"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			bucket, key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset, transport, c.BotIndex); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PutMultipartUploadMetadata stores the headers captured at
