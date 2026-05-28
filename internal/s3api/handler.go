@@ -802,7 +802,21 @@ func (h *Handler) authorized(r *http.Request) bool {
 	canonicalRequest := canonicalRequest(r.Method, canonicalURI(r), canonicalQuery(r.URL.Query(), ""), canonicalHeaders(r, signedHeaders), signedHeaders, payloadHash)
 	stringToSign := stringToSign(amzDate, date, region, service, canonicalRequest)
 	expected := sign(h.cfg.SecretAccessKey, date, region, service, stringToSign)
-	return hmac.Equal([]byte(expected), []byte(signature))
+	if !hmac.Equal([]byte(expected), []byte(signature)) {
+		h.logger.Warn("sigv4 header-auth mismatch (DEBUG)",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"rawQuery", r.URL.RawQuery,
+			"host", r.Host,
+			"signedHeaders", signedHeaders,
+			"expected", expected,
+			"received", signature,
+			"canonicalRequest", canonicalRequest,
+			"ua", r.Header.Get("User-Agent"),
+		)
+		return false
+	}
+	return true
 }
 
 func (h *Handler) authorizedPresigned(r *http.Request, provided string) bool {
@@ -837,7 +851,19 @@ func (h *Handler) authorizedPresigned(r *http.Request, provided string) bool {
 	canonicalRequest := canonicalRequest(r.Method, canonicalURI(r), canonicalQuery(q, "X-Amz-Signature"), canonicalHeaders(r, signedHeaders), signedHeaders, payloadHash)
 	stringToSign := stringToSign(amzDate, date, region, service, canonicalRequest)
 	expected := sign(h.cfg.SecretAccessKey, date, region, service, stringToSign)
-	return hmac.Equal([]byte(expected), []byte(provided))
+	if !hmac.Equal([]byte(expected), []byte(provided)) {
+		h.logger.Warn("sigv4 presigned mismatch (DEBUG)",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"signedHeaders", signedHeaders,
+			"expected", expected,
+			"received", provided,
+			"canonicalRequest", canonicalRequest,
+			"ua", r.Header.Get("User-Agent"),
+		)
+		return false
+	}
+	return true
 }
 
 // splitBucketKey resolves the bucket+key from either virtual-hosted
