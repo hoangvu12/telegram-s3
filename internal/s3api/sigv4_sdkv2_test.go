@@ -93,6 +93,79 @@ func TestSDKv2StyleListBuckets(t *testing.T) {
 	}
 }
 
+// TestAcceptEncodingMutationTolerance verifies the CDN-tolerance path: when a
+// client (rclone v1.74 / AWS SDK Go v2) signs with `accept-encoding: identity`
+// but Cloudflare rewrites the request to `accept-encoding: gzip, br` before it
+// reaches the gateway, the gateway accepts the signature on retry. CF blocks
+// setting Accept-Encoding via Transform Rules, so this server-side fallback is
+// the only way to keep CF in front of the gateway.
+func TestAcceptEncodingMutationTolerance(t *testing.T) {
+	h := testHandler()
+
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	date := amzDate[:8]
+	region, service := "us-east-1", "s3"
+	host := "s3.nguyenvu.dev"
+	emptyHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	// Client signs with Accept-Encoding: identity.
+	signed := []string{"accept-encoding", "host", "x-amz-content-sha256", "x-amz-date"}
+	sort.Strings(signed)
+	signedHeaders := strings.Join(signed, ";")
+	clientValues := map[string]string{
+		"accept-encoding":      "identity",
+		"host":                 host,
+		"x-amz-content-sha256": emptyHash,
+		"x-amz-date":           amzDate,
+	}
+	var hdrBuf strings.Builder
+	for _, n := range signed {
+		hdrBuf.WriteString(n)
+		hdrBuf.WriteByte(':')
+		hdrBuf.WriteString(clientValues[n])
+		hdrBuf.WriteByte('\n')
+	}
+	canonReq := strings.Join([]string{"GET", "/", "", hdrBuf.String(), signedHeaders, emptyHash}, "\n")
+	stsHash := sha256.Sum256([]byte(canonReq))
+	sts := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + date + "/" + region + "/" + service + "/aws4_request\n" + hex.EncodeToString(stsHash[:])
+	mac := func(key []byte, data string) []byte {
+		m := hmac.New(sha256.New, key)
+		m.Write([]byte(data))
+		return m.Sum(nil)
+	}
+	kDate := mac([]byte("AWS4"+testSecret), date)
+	kRegion := mac(kDate, region)
+	kService := mac(kRegion, service)
+	kSigning := mac(kService, "aws4_request")
+	sig := hex.EncodeToString(mac(kSigning, sts))
+
+	// Build the request as the gateway actually receives it: Cloudflare has
+	// rewritten Accept-Encoding to "gzip, br", but the signature was computed
+	// over "identity".
+	r := httptest.NewRequest("GET", "https://"+host+"/", nil)
+	r.Host = host
+	r.Header.Set("Accept-Encoding", "gzip, br")
+	r.Header.Set("X-Amz-Content-Sha256", emptyHash)
+	r.Header.Set("X-Amz-Date", amzDate)
+	r.Header.Set("Authorization",
+		"AWS4-HMAC-SHA256 Credential="+testAK+"/"+date+"/"+region+"/"+service+"/aws4_request, "+
+			"SignedHeaders="+signedHeaders+", Signature="+sig)
+
+	if !h.authorized(r) {
+		t.Error("handler rejected a request whose Accept-Encoding was mutated by a CDN — tolerance retry should have accepted it")
+	}
+
+	// Sanity: a wrong signature is still rejected even with the retry path
+	// active.
+	r.Header.Set("Authorization",
+		"AWS4-HMAC-SHA256 Credential="+testAK+"/"+date+"/"+region+"/"+service+"/aws4_request, "+
+			"SignedHeaders="+signedHeaders+", Signature=deadbeef")
+	if h.authorized(r) {
+		t.Error("handler accepted a forged signature — tolerance retry must not be a bypass")
+	}
+}
+
 // Also ensure the request without amz-sdk-* headers — what the AWS CLI sends —
 // still works, so we know the SDK-v2 case is the only differentiator.
 func TestSDKv2StyleListBuckets_CLIShape(t *testing.T) {

@@ -799,24 +799,44 @@ func (h *Handler) authorized(r *http.Request) bool {
 		payloadHash = "UNSIGNED-PAYLOAD"
 	}
 
-	canonicalRequest := canonicalRequest(r.Method, canonicalURI(r), canonicalQuery(r.URL.Query(), ""), canonicalHeaders(r, signedHeaders), signedHeaders, payloadHash)
-	stringToSign := stringToSign(amzDate, date, region, service, canonicalRequest)
-	expected := sign(h.cfg.SecretAccessKey, date, region, service, stringToSign)
-	if !hmac.Equal([]byte(expected), []byte(signature)) {
-		h.logger.Warn("sigv4 header-auth mismatch (DEBUG)",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"rawQuery", r.URL.RawQuery,
-			"host", r.Host,
-			"signedHeaders", signedHeaders,
-			"expected", expected,
-			"received", signature,
-			"canonicalRequest", canonicalRequest,
-			"ua", r.Header.Get("User-Agent"),
-		)
-		return false
+	if h.verifyHeaderSig(r, signedHeaders, amzDate, date, region, service, payloadHash, signature) {
+		return true
 	}
-	return true
+	// Cloudflare (and some other CDNs) rewrite request-side Accept-Encoding to
+	// negotiate compression with origin, and CF's "Modify Request Header"
+	// Transform Rule explicitly forbids setting Accept-Encoding — so a client
+	// behind CF that signs `accept-encoding: identity` (AWS SDK Go v2's
+	// default, used by rclone v1.74+) sees its signature rejected because the
+	// gateway receives `gzip, br`. Retry verification with the SDK default
+	// before giving up. Cost: any client could sign `identity` and verify
+	// regardless of the on-wire value, which is harmless for a header that
+	// only governs response encoding.
+	if hasSigned(signedHeaders, "accept-encoding") &&
+		!strings.EqualFold(r.Header.Get("Accept-Encoding"), "identity") {
+		return h.verifyHeaderSigWith(r, signedHeaders, amzDate, date, region, service, payloadHash, signature,
+			map[string]string{"accept-encoding": "identity"})
+	}
+	return false
+}
+
+func (h *Handler) verifyHeaderSig(r *http.Request, signedHeaders, amzDate, date, region, service, payloadHash, signature string) bool {
+	return h.verifyHeaderSigWith(r, signedHeaders, amzDate, date, region, service, payloadHash, signature, nil)
+}
+
+func (h *Handler) verifyHeaderSigWith(r *http.Request, signedHeaders, amzDate, date, region, service, payloadHash, signature string, override map[string]string) bool {
+	canon := canonicalRequest(r.Method, canonicalURI(r), canonicalQuery(r.URL.Query(), ""), canonicalHeadersWith(r, signedHeaders, override), signedHeaders, payloadHash)
+	sts := stringToSign(amzDate, date, region, service, canon)
+	expected := sign(h.cfg.SecretAccessKey, date, region, service, sts)
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+func hasSigned(signedHeaders, name string) bool {
+	for _, h := range strings.Split(signedHeaders, ";") {
+		if strings.EqualFold(strings.TrimSpace(h), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) authorizedPresigned(r *http.Request, provided string) bool {
@@ -851,19 +871,7 @@ func (h *Handler) authorizedPresigned(r *http.Request, provided string) bool {
 	canonicalRequest := canonicalRequest(r.Method, canonicalURI(r), canonicalQuery(q, "X-Amz-Signature"), canonicalHeaders(r, signedHeaders), signedHeaders, payloadHash)
 	stringToSign := stringToSign(amzDate, date, region, service, canonicalRequest)
 	expected := sign(h.cfg.SecretAccessKey, date, region, service, stringToSign)
-	if !hmac.Equal([]byte(expected), []byte(provided)) {
-		h.logger.Warn("sigv4 presigned mismatch (DEBUG)",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"signedHeaders", signedHeaders,
-			"expected", expected,
-			"received", provided,
-			"canonicalRequest", canonicalRequest,
-			"ua", r.Header.Get("User-Agent"),
-		)
-		return false
-	}
-	return true
+	return hmac.Equal([]byte(expected), []byte(provided))
 }
 
 // splitBucketKey resolves the bucket+key from either virtual-hosted
@@ -997,11 +1005,20 @@ func canonicalQuery(values url.Values, skip string) string {
 }
 
 func canonicalHeaders(r *http.Request, signedHeaders string) string {
+	return canonicalHeadersWith(r, signedHeaders, nil)
+}
+
+// canonicalHeadersWith is canonicalHeaders with an optional per-header override
+// map keyed by lowercased name. Used by the Accept-Encoding tolerance retry —
+// see the comment in (*Handler).authorized().
+func canonicalHeadersWith(r *http.Request, signedHeaders string, override map[string]string) string {
 	var builder strings.Builder
 	for _, name := range strings.Split(signedHeaders, ";") {
 		lower := strings.ToLower(name)
 		value := ""
-		if lower == "host" {
+		if v, ok := override[lower]; ok {
+			value = v
+		} else if lower == "host" {
 			value = r.Host
 		} else {
 			value = r.Header.Get(name)
